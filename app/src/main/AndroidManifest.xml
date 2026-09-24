@@ -8,7 +8,7 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
-        android:name=".RvcApplication"
+        android:name=".DreamLiteApp"
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@style/Theme.DreamLiteRvc">
@@ -34,7 +34,7 @@
         </activity>
 
         <service
-            android:name=".RvcComputeService"
+            android:name=".service.RvcLiveService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 

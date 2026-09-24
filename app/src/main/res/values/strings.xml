@@ -1,4 +1,74 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- ====== App ====== -->
     <string name="app_name">DreamLite RVC</string>
+
+    <!-- ====== Navigation ====== -->
+    <string name="nav_home">Home</string>
+    <string name="nav_settings">Settings</string>
+
+    <!-- ====== Home ====== -->
+    <string name="home_subtitle">Real-time neural voice conversion on the Hexagon NPU.</string>
+    <string name="home_status_idle">Idle</string>
+    <string name="home_status_running">Converting</string>
+    <string name="home_record">Record</string>
+    <string name="home_stop">Stop</string>
+    <string name="home_recorded">Recorded</string>
+    <string name="home_play_original">Play original</string>
+    <string name="home_play_converted">Play converted</string>
+    <string name="home_save_wav">Save WAV</string>
+    <string name="home_no_input">No recording yet</string>
+    <string name="home_no_output">Run a conversion first</string>
+
+    <!-- ====== Runtime stats ====== -->
+    <string name="stats_title">Runtime</string>
+    <string name="stats_rtf">RTF</string>
+    <string name="stats_rtf_target">target &lt; 0.8</string>
+    <string name="stats_block">Per block</string>
+    <string name="stats_blocks">blocks</string>
+    <string name="stats_stage_index">retrieval</string>
+    <string name="stats_stage_f0">f0</string>
+    <string name="stats_stage_enc">encoder</string>
+    <string name="stats_stage_synth">synth</string>
+    <string name="stats_peak">output peak</string>
+
+    <!-- ====== Permissions ====== -->
+    <string name="perm_mic_rationale">Voice conversion needs the microphone. Grant access to start recording.</string>
+    <string name="perm_mic_denied">Microphone permission denied — recording is unavailable.</string>
+    <string name="perm_notif_rationale">A persistent notification keeps the NPU pipeline at full clock during conversion.</string>
+
+    <!-- ====== Settings: voice ====== -->
+    <string name="settings_voice">Voice</string>
+    <string name="settings_voice_none">No voices found</string>
+    <string name="settings_voice_hint">Copy a voice folder into the app\'s voices directory (see below). Each folder needs the .bin graphs plus voice.json.</string>
+
+    <!-- ====== Settings: retrieval ====== -->
+    <string name="settings_retrieval">Feature retrieval</string>
+    <string name="settings_index_rate">Index blend rate</string>
+    <string name="settings_index_rate_off">off</string>
+    <string name="settings_index_rate_summary">%1$.2f — blends encoder features with the nearest training features</string>
+    <string name="settings_nprobe">Probe lists (nprobe)</string>
+    <string name="settings_nprobe_auto">auto (from the .index file)</string>
+
+    <!-- ====== Settings: audio ====== -->
+    <string name="settings_audio">Audio</string>
+    <string name="settings_monitor">Monitor converted audio while recording</string>
+    <string name="settings_monitor_subtitle">Plays the 40 kHz output through the speaker / headphones</string>
+    <string name="settings_noise_gate">Noise gate (dB)</string>
+
+    <!-- ====== Settings: diagnostics ====== -->
+    <string name="settings_diag">Diagnostics</string>
+    <string name="settings_job_log">Per-job graph timing log</string>
+    <string name="settings_job_log_subtitle">Writes qnn_jobs.log next to the models. Zero measured cost.</string>
+    <string name="settings_files_dir">App files directory</string>
+    <string name="settings_models_dir">Models directory</string>
+    <string name="settings_voices_dir">Voices directory</string>
+
+    <!-- ====== Errors ====== -->
+    <string name="err_pipeline_init">Pipeline failed to start: %1$s</string>
+    <string name="err_no_voice">No voice selected. Add one in Settings.</string>
+    <string name="err_audio_record">Recording failed: %1$s</string>
+    <string name="err_audio_play">Playback failed: %1$s</string>
+    <string name="err_save">Save failed: %1$s</string>
+    <string name="err_crash">Native crash captured — see crash.txt in the files directory</string>
 </resources>

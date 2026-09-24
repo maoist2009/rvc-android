@@ -107,4 +107,28 @@ dependencies {
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
+
+    // DataStore (settings persistence)
+    implementation("androidx.datastore:datastore-preferences:1.1.7")
+
+    // Coroutines
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+
+    // NOTE: navigation-compose is NOT used. Its AARs are absent from this
+    // machine's Gradle cache, so an offline build cannot resolve them. The
+    // two-screen app uses a simple in-Compose state switch instead.
+
+    // Offline-cache repairs: datastore pulls in three artifacts this machine
+    // has no copy of. Pin/substitute each to the nearest cached one.
+    configurations.all {
+        resolutionStrategy {
+            force("org.jetbrains.kotlin:kotlin-parcelize-runtime:1.7.20")
+            // okio multiplatform is uncached; its JVM twin is the same API.
+            dependencySubstitution {
+                substitute(module("com.squareup.okio:okio"))
+                    .using(module("com.squareup.okio:okio-jvm:3.9.1"))
+                    .because("okio multiplatform artifacts are not in the offline cache")
+            }
+        }
+    }
 }
