@@ -1,0 +1,19 @@
+# build outputs
+app/build/
+build/
+app/.cxx/
+.gradle/
+.kotlin/
+.cxx/
+
+# ide / machine-local
+local.properties
+
+# upstream reference clone (public repo, not our code)
+reference/
+
+# qwen code agent state
+.qwen/
+
+# stray clipboard artifacts
+[0-9]*"
