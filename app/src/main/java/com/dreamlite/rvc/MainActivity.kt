@@ -14,9 +14,11 @@ import androidx.compose.material3.Surface
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.viewmodel.compose.viewModel
 import com.dreamlite.rvc.engine.RvcState
 import com.dreamlite.rvc.service.RvcLiveService
 import com.dreamlite.rvc.ui.nav.DreamLiteNavHost
+import com.dreamlite.rvc.ui.home.HomeViewModel
 import com.dreamlite.rvc.ui.theme.DreamLiteTheme
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -51,6 +53,16 @@ class MainActivity : ComponentActivity() {
                         if (!granted) { /* the UI shows its own denied state */ }
                     }
 
+                    // SAF picker for offline conversion: any audio the system
+                    // can decode is accepted; AudioDecoder turns it into the
+                    // 16 kHz mono f32 the pipeline consumes.
+                    val homeVm: HomeViewModel = viewModel()
+                    val audioPicker = rememberLauncherForActivityResult(
+                        ActivityResultContracts.OpenDocument()
+                    ) { uri ->
+                        uri?.let { homeVm.convertOffline(it) }
+                    }
+
                     val notifLauncher = rememberLauncherForActivityResult(
                         ActivityResultContracts.RequestPermission()
                     ) { /* best-effort; foreground priority does not need it */ }
@@ -63,6 +75,7 @@ class MainActivity : ComponentActivity() {
 
                     DreamLiteNavHost(
                         onRequestMic = { micLauncher.launch(Manifest.permission.RECORD_AUDIO) },
+                        onPickAudio = { audioPicker.launch(arrayOf("audio/*")) },
                     )
                 }
             }

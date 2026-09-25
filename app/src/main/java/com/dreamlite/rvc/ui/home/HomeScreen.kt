@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AudioFile
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Save
@@ -57,6 +58,7 @@ import com.dreamlite.rvc.ui.theme.Spacing
 fun HomeScreen(
     viewModel: HomeViewModel,
     onRequestMic: () -> Unit,
+    onPickAudio: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val state by viewModel.state.collectAsState()
@@ -86,6 +88,13 @@ fun HomeScreen(
             onStop = { viewModel.stop() },
             onPlayConverted = { viewModel.playConverted() },
             onRequestMic = onRequestMic,
+        )
+
+        ConvertCard(
+            state = state,
+            onPick = onPickAudio,
+            onPlayConverted = { viewModel.playConverted() },
+            onSaveWav = { viewModel.saveWav() },
         )
 
         StatsCard(state = state)
@@ -199,6 +208,82 @@ private fun RecordCard(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
                 )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ConvertCard(
+    state: RvcState,
+    onPick: () -> Unit,
+    onPlayConverted: () -> Unit,
+    onSaveWav: () -> Unit,
+) {
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainerLow
+        ),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier.padding(Spacing.lg),
+            verticalArrangement = Arrangement.spacedBy(Spacing.md),
+        ) {
+            Text(
+                text = stringResource(R.string.convert_title),
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            val busy = state is RvcState.Loading || state is RvcState.Running
+            Button(
+                onClick = onPick,
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !busy,
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.AudioFile,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(Modifier.size(Spacing.sm))
+                Text(stringResource(R.string.convert_pick))
+            }
+            when (state) {
+                is RvcState.Loading -> Text(
+                    text = state.label,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                is RvcState.Error -> Text(
+                    text = state.message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+                else -> Unit
+            }
+            if (state is RvcState.Done) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(Spacing.md),
+                ) {
+                    FilledTonalButton(
+                        onClick = onPlayConverted,
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Icon(Icons.Filled.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.size(Spacing.sm))
+                        Text(stringResource(R.string.home_play_converted))
+                    }
+                    FilledTonalButton(
+                        onClick = onSaveWav,
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Icon(Icons.Filled.Save, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.size(Spacing.sm))
+                        Text(stringResource(R.string.convert_save))
+                    }
+                }
             }
         }
     }

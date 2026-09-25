@@ -127,14 +127,17 @@ class VoiceManager(private val context: Context) {
         return try {
             if (!modelsDir.isDirectory && !modelsDir.mkdirs())
                 return "cannot create models dir"
-            if (!sharedReady())
+            val sharedDir = File(voicesDir, SHARED_VOICE_NAME)
+            // voices/shared/ is the pack layout; a self-contained voice folder
+            // (one that carries the shared graphs itself) is equally valid.
+            val sharedSrc = if (sharedReady()) sharedDir else voice.dir
+            if (!sharedRoles.all { File(sharedSrc, it).isFile })
                 return "shared components missing — import the shared pack first"
             cleanStaged()
 
-            // Shared: link from voices/shared (relative symlink still works,
+            // Shared: link from the shared pack (relative symlink still works,
             // both live under filesDir).
-            val sharedErr = linkOneOrCopy(
-                File(voicesDir, SHARED_VOICE_NAME), modelsDir, sharedRoles)
+            val sharedErr = linkOneOrCopy(sharedSrc, modelsDir, sharedRoles)
             if (sharedErr != null) return sharedErr
             // Voice-specific.
             val voiceErr = linkOneOrCopy(

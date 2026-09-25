@@ -20,6 +20,10 @@
     <string name="home_no_input">No recording yet</string>
     <string name="home_no_output">Run a conversion first</string>
 
+    <string name="convert_title">Convert an audio file</string>
+    <string name="convert_pick">Pick audio (mp3, m4a, wav…)</string>
+    <string name="convert_save">Save WAV</string>
+
     <!-- ====== Runtime stats ====== -->
     <string name="stats_title">Runtime</string>
     <string name="stats_rtf">RTF</string>

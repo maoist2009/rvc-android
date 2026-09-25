@@ -17,6 +17,7 @@
             <intent-filter>
                 <action android:name="com.dreamlite.rvc.RUN_PIPELINE" />
                 <action android:name="com.dreamlite.rvc.RUN_REALTIME" />
+                <action android:name="com.dreamlite.rvc.RUN_CONVERT" />
             </intent-filter>
         </receiver>
 

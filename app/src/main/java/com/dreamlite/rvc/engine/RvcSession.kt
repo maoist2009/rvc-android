@@ -171,6 +171,61 @@ class RvcSession(
         }
     }
 
+    /**
+     * Converts a complete 16 kHz mono buffer offline. Feeds the streaming
+     * pipeline in 4 000-sample strides, collects every emitted 40 kHz block
+     * and flushes the tail. Reports progress through the state while it runs.
+     * Returns null on success or the error string.
+     */
+    suspend fun convertOffline(input: FloatArray): String? =
+        withContext(Dispatchers.Default) {
+            val initErr = ensureInitialized()
+            if (initErr != null) {
+                _state.value = RvcState.Error(initErr)
+                return@withContext initErr
+            }
+            _state.value = RvcState.Loading("Converting…")
+            val streamErr = RvcJni.pipelineStreamStart()
+            if (streamErr.isNotEmpty()) {
+                _state.value = RvcState.Error("streamStart: $streamErr")
+                return@withContext streamErr
+            }
+
+            val stride = 4_000
+            val out = ArrayList<FloatArray>()
+            var outSamples = 0
+            var off = 0
+            while (off < input.size) {
+                val n = minOf(stride, input.size - off)
+                val block = if (n == stride) input.copyOfRange(off, off + n)
+                else input.copyOfRange(off, off + n)
+                off += n
+                val emitted = RvcJni.pipelineStreamFeed(block)
+                if (emitted.isNotEmpty()) {
+                    out.add(emitted)
+                    outSamples += emitted.size
+                }
+                val s = RvcStats.parse(RvcJni.pipelineStats())
+                _state.value = RvcState.Running(
+                    rtf = s?.rtf ?: 1f,
+                    msPerBlock = s?.msTotal?.div(s.nBlocks.coerceAtLeast(1)) ?: 0f,
+                    msIndex = s?.msIndex ?: 0f,
+                    blocks = s?.nBlocks ?: 0,
+                    peak = if (out.isEmpty()) 0f else computePeak(out.last()),
+                )
+            }
+            val tail = RvcJni.pipelineStreamEnd()
+            if (tail.isNotEmpty()) { out.add(tail); outSamples += tail.size }
+
+            val merged = FloatArray(outSamples)
+            var p = 0
+            for (b in out) { System.arraycopy(b, 0, merged, p, b.size); p += b.size }
+            lastOutput = merged
+            val final = RvcStats.parse(RvcJni.pipelineStats())
+            _state.value = RvcState.Done(merged, final?.rtf ?: 1f)
+            null
+        }
+
     /** Plays back the last converted output. Returns null on success. */
     suspend fun playLast(): String? = withContext(Dispatchers.Default) {
         val out = lastOutput ?: return@withContext "no output yet"
@@ -185,6 +240,86 @@ class RvcSession(
         }
         p.stop()
         null
+    }
+
+    /** Surfaces a message to the UI without throwing. */
+    fun reportError(message: String) {
+        _state.value = RvcState.Error(message)
+    }
+
+    /**
+     * Writes the last converted output as a 40 kHz mono WAV into the shared
+     * media collection (Music/DreamLite/), so a file manager can pick it up.
+     * Returns null on success.
+     */
+    suspend fun saveLastWavToMedia(context: android.content.Context): String? =
+        withContext(Dispatchers.Default) {
+            val out = lastOutput ?: return@withContext "no output yet"
+            val name = "dreamlite_${System.currentTimeMillis()}.wav"
+            try {
+                val resolver = context.contentResolver
+                val collection = android.provider.MediaStore.Audio.Media
+                    .getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                val values = android.content.ContentValues().apply {
+                    put(android.provider.MediaStore.Audio.Media.DISPLAY_NAME, name)
+                    put(android.provider.MediaStore.Audio.Media.MIME_TYPE, "audio/wav")
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                        put(
+                            android.provider.MediaStore.Audio.Media.RELATIVE_PATH,
+                            "Music/DreamLite",
+                        )
+                        put(android.provider.MediaStore.Audio.Media.IS_PENDING, 1)
+                    }
+                }
+                val uri = resolver.insert(collection, values)
+                    ?: return@withContext "MediaStore insert failed"
+                resolver.openOutputStream(uri)?.use { os ->
+                    writeWav(os, out)
+                } ?: return@withContext "cannot open MediaStore stream"
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                    val done = android.content.ContentValues().apply {
+                        put(android.provider.MediaStore.Audio.Media.IS_PENDING, 0)
+                    }
+                    resolver.update(uri, done, null, null)
+                }
+                null
+            } catch (e: Exception) {
+                e.message ?: e.javaClass.simpleName
+            }
+        }
+
+    private fun writeWav(os: java.io.OutputStream, out: FloatArray) {
+        val d = java.io.DataOutputStream(os)
+        d.writeBytes("RIFF")
+        d.writeInt(Integer.reverseBytes(36 + out.size * 2))
+        d.writeBytes("WAVE")
+        d.writeBytes("fmt ")
+        d.writeInt(Integer.reverseBytes(16))
+        d.writeShort(1)                       // PCM
+        d.writeShort(1)                       // mono
+        d.writeInt(Integer.reverseBytes(40_000))
+        d.writeInt(Integer.reverseBytes(40_000 * 2))
+        d.writeShort(2)                       // s16
+        d.writeShort(16)                      // bits
+        d.writeBytes("data")
+        d.writeInt(Integer.reverseBytes(out.size * 2))
+        // s16 LE, written little-endian directly
+        for (v in out) {
+            val q = (v.coerceIn(-1f, 1f) * 32767f).toInt()
+            d.write(q and 0xff)
+            d.write((q shr 8) and 0xff)
+        }
+    }
+
+    /** Writes the last converted output as a 40 kHz mono WAV. Returns the path. */
+    suspend fun saveLastWav(dest: java.io.File): String? = withContext(Dispatchers.Default) {
+        val out = lastOutput ?: return@withContext "no output yet"
+        try {
+            java.io.FileOutputStream(dest).use { writeWav(it, out) }
+            dest.absolutePath
+        } catch (e: Exception) {
+            e.message ?: e.javaClass.simpleName
+        }
     }
 
     private fun computePeak(block: FloatArray): Float {

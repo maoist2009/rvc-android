@@ -36,6 +36,7 @@ enum class Screen { Home, Settings }
 @Composable
 fun DreamLiteNavHost(
     onRequestMic: () -> Unit,
+    onPickAudio: () -> Unit,
 ) {
     var screen by remember { mutableStateOf(Screen.Home) }
 
@@ -63,6 +64,7 @@ fun DreamLiteNavHost(
                 HomeScreen(
                     viewModel = vm,
                     onRequestMic = onRequestMic,
+                    onPickAudio = onPickAudio,
                     modifier = Modifier.fillMaxSize().padding(inner),
                 )
             }

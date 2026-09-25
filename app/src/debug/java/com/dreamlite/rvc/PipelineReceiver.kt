@@ -39,6 +39,7 @@ class PipelineReceiver : BroadcastReceiver() {
         when (intent.action) {
             ACTION_PIPELINE -> runPipeline(context)
             ACTION_REALTIME -> runRealtime(context, intent)
+            ACTION_CONVERT -> runConvert(context, intent)
         }
     }
 
@@ -152,10 +153,71 @@ class PipelineReceiver : BroadcastReceiver() {
         }
     }
 
+    private fun runConvert(context: Context, intent: Intent) {
+        val app = context.applicationContext as DreamLiteApp
+        val input = intent.getStringExtra("input") ?: "b8231_in.mp3"
+        val outF32 = intent.getStringExtra("output") ?: "convert_out.f32"
+        val outWav = intent.getStringExtra("wav") ?: "convert_out.wav"
+        Log.i(TAG, "convert: input=$input output=$outF32 wav=$outWav")
+        val pending = goAsync()
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            try {
+                RvcLiveService.start(context)
+                val src = File(context.filesDir, input)
+                if (!src.isFile) {
+                    Log.e(TAG, "missing input: $src")
+                    return@launch
+                }
+
+                // exact UI path: AudioDecoder -> session.convertOffline
+                val samples = com.dreamlite.rvc.data.AudioDecoder.decodeTo16kMono(src)
+                    ?: com.dreamlite.rvc.data.AudioDecoder.readF32(src)
+                if (samples == null || samples.isEmpty()) {
+                    Log.e(TAG, "decode failed for $input")
+                    return@launch
+                }
+                Log.i(TAG, "decoded in=${samples.size} samples @16k mono")
+
+                val dump = intent.getStringExtra("dump")
+                if (dump != null) {
+                    val db = java.nio.ByteBuffer.allocate(samples.size * 4)
+                        .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                    db.asFloatBuffer().put(samples)
+                    File(context.filesDir, dump).writeBytes(db.array())
+                }
+
+                val err = app.session.convertOffline(samples)
+                if (err != null) {
+                    Log.e(TAG, "convert err=$err")
+                    return@launch
+                }
+                val out = app.session.lastOutput ?: run {
+                    Log.e(TAG, "no output produced")
+                    return@launch
+                }
+                Log.i(TAG, "converted out=${out.size} stats=${com.dreamlite.rvc.RvcJni.pipelineStats()}")
+
+                val bb = java.nio.ByteBuffer.allocate(out.size * 4)
+                    .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                bb.asFloatBuffer().put(out)
+                File(context.filesDir, outF32).writeBytes(bb.array())
+
+                val wavPath = app.session.saveLastWav(File(context.filesDir, outWav))
+                Log.i(TAG, "wav -> $wavPath")
+            } catch (t: Throwable) {
+                Log.e(TAG, "convert receiver threw", t)
+            } finally {
+                try { RvcLiveService.stop(context) } catch (t: Throwable) { }
+                pending.finish()
+            }
+        }
+    }
+
     companion object {
         private const val TAG = "rvc_pipeline_test"
         private const val BLOCK = 4000
         const val ACTION_PIPELINE = "com.dreamlite.rvc.RUN_PIPELINE"
         const val ACTION_REALTIME = "com.dreamlite.rvc.RUN_REALTIME"
+        const val ACTION_CONVERT = "com.dreamlite.rvc.RUN_CONVERT"
     }
 }
