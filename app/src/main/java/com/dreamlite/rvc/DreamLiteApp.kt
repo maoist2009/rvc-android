@@ -2,6 +2,7 @@ package com.dreamlite.rvc
 
 import android.app.Application
 import android.system.Os
+import com.dreamlite.rvc.data.PackManager
 import com.dreamlite.rvc.data.SettingsRepository
 import com.dreamlite.rvc.data.VoiceManager
 import com.dreamlite.rvc.engine.RvcSession
@@ -56,6 +57,8 @@ class DreamLiteApp : Application() {
     val settingsRepository: SettingsRepository by lazy { SettingsRepository(this) }
 
     val voiceManager: VoiceManager by lazy { VoiceManager(this) }
+
+    val packManager: PackManager by lazy { PackManager(this, voiceManager) }
 
     val session: RvcSession by lazy {
         RvcSession(

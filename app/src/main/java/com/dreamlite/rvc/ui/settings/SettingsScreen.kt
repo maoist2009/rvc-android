@@ -9,9 +9,12 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
@@ -40,6 +43,15 @@ fun SettingsScreen(viewModel: SettingsViewModel, modifier: Modifier = Modifier) 
             .padding(Spacing.lg),
         verticalArrangement = Arrangement.spacedBy(Spacing.lg),
     ) {
+        ImportCard(
+            state = viewModel.packs.collectAsState().value,
+            onRescan = viewModel::rescanPacks,
+            onInstallShared = viewModel::installShared,
+            onInstallVoice = viewModel::installVoice,
+            onValidateVoice = viewModel::validateVoice,
+            onDeepCheck = viewModel::deepCheckVoice,
+        )
+
         VoiceCard(
             voices = voices,
             selected = settings.voiceName,
@@ -84,6 +96,127 @@ private fun SectionCard(title: String, content: @Composable ColumnScope.() -> Un
                 fontWeight = FontWeight.SemiBold,
             )
             content()
+        }
+    }
+}
+
+@Composable
+private fun ImportCard(
+    state: com.dreamlite.rvc.data.PackManager.ScanResult,
+    onRescan: () -> Unit,
+    onInstallShared: () -> Unit,
+    onInstallVoice: (com.dreamlite.rvc.data.PackManager.VoicePack) -> Unit,
+    onValidateVoice: (com.dreamlite.rvc.data.PackManager.VoicePack) -> Unit,
+    onDeepCheck: (com.dreamlite.rvc.data.PackManager.VoicePack) -> Unit,
+) {
+    SectionCard(title = stringResource(R.string.settings_import)) {
+        val result = state
+        Text(
+            text = stringResource(R.string.settings_import_hint),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        PathRow(
+            label = stringResource(R.string.settings_packs_dir),
+            path = result.shared?.dir?.parent?.toString() ?: "",
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(Spacing.md),
+        ) {
+            OutlinedButton(onClick = onRescan, modifier = Modifier.weight(1f)) {
+                Text(stringResource(R.string.import_rescan))
+            }
+        }
+
+        // ---- shared components ----
+        val shared = result.shared
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = stringResource(R.string.import_shared),
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                val msg = when {
+                    shared == null -> stringResource(R.string.import_not_found)
+                    shared.ready -> if (result.installedShared)
+                        stringResource(R.string.import_installed) else stringResource(R.string.import_ready)
+                    else -> shared.problems.joinToString("\n") { "• ${it.file}: ${it.reason}" }
+                }
+                Text(
+                    text = msg,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (shared?.ready == true) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.error,
+                )
+            }
+            Button(
+                onClick = onInstallShared,
+                enabled = shared?.ready == true && !result.installedShared,
+            ) {
+                Text(stringResource(R.string.import_install))
+            }
+        }
+
+        // ---- voice packs ----
+        if (result.voices.isEmpty() && shared != null) {
+            Text(
+                text = stringResource(R.string.import_no_voices),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        result.voices.forEach { pack ->
+            HorizontalDivider(
+                color = MaterialTheme.colorScheme.outlineVariant,
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.Top,
+                horizontalArrangement = Arrangement.spacedBy(Spacing.md),
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = pack.name,
+                        style = MaterialTheme.typography.bodyLarge,
+                        fontWeight = FontWeight.Medium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    val installed = pack.name in result.installedVoices
+                    val msg = when {
+                        installed -> stringResource(R.string.import_installed)
+                        pack.problems.isEmpty() ->
+                            (pack.index?.name?.let { stringResource(R.string.import_with_index, it) }
+                                ?: stringResource(R.string.import_ready))
+                        else -> pack.problems.joinToString("\n") { "• ${it.file}: ${it.reason}" }
+                    }
+                    Text(
+                        text = msg,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (pack.problems.isEmpty()) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.error,
+                    )
+                }
+                Column(verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
+                    Button(
+                        onClick = { onInstallVoice(pack) },
+                        enabled = pack.ready && pack.name !in result.installedVoices,
+                    ) {
+                        Text(stringResource(R.string.import_install))
+                    }
+                    OutlinedButton(
+                        onClick = { onValidateVoice(pack) },
+                        enabled = pack.ready,
+                    ) {
+                        Text(stringResource(R.string.import_check))
+                    }
+                }
+            }
         }
     }
 }

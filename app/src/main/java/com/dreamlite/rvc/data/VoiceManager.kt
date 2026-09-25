@@ -21,6 +21,11 @@ import kotlinx.coroutines.flow.asStateFlow
  */
 class VoiceManager(private val context: Context) {
 
+    companion object {
+        /** Holds the shared components (HuBERT/RMVPE/conv0_gn) shared by all voices. */
+        const val SHARED_VOICE_NAME = "shared"
+    }
+
     data class Voice(
         val name: String,
         val dir: File,
@@ -42,7 +47,23 @@ class VoiceManager(private val context: Context) {
         "conv0_gn.f32",
     )
 
+    /** Only the voice-specific graphs; shared ones come from the shared dir. */
+    private val voiceRoles = listOf(
+        "encflow.bin",
+        "flowreverse.bin",
+        "decnsf_ext.bin",
+    )
+
     private val indexNames = listOf("index.path", "retrieval.index")
+
+    /** Files the pipeline needs but that are shared across voices. */
+    private val sharedRoles = listOf(
+        "hubert_c0_s23.bin",
+        "hubert_r_2063_s23.bin",
+        "hubert_enc_140_s23.bin",
+        "rmvpe_e2e_s23.bin",
+        "conv0_gn.f32",
+    )
 
     private val _voicesFlow = MutableStateFlow<List<Voice>>(emptyList())
     /** The voice list as a flow; refreshed by [rescan] and on first access. */
@@ -53,13 +74,18 @@ class VoiceManager(private val context: Context) {
     /** Re-reads the voices directory. Call after copying a voice in. */
     fun rescan() { _voicesFlow.value = list() }
 
-    /** Lists every folder under voices/ that has all required graphs. */
+    /**
+     * Lists every voice folder that has all its OWN graphs and a manifest.
+     * [SHARED_VOICE_NAME] is excluded — it holds the shared components only.
+     * The shared graphs are checked separately by [sharedReady].
+     */
     fun list(): List<Voice> {
         if (!voicesDir.isDirectory) return emptyList()
         return voicesDir.listFiles { f -> f.isDirectory }
             ?.sortedBy { it.name }
             ?.mapNotNull { dir ->
-                val hasAll = requiredGraphs.all { File(dir, it).isFile }
+                if (dir.name == SHARED_VOICE_NAME) return@mapNotNull null
+                val hasAll = voiceRoles.all { File(dir, it).isFile }
                 if (!hasAll) null else Voice(
                     name = dir.name,
                     dir = dir,
@@ -68,6 +94,14 @@ class VoiceManager(private val context: Context) {
             }
             ?: emptyList()
     }
+
+    /** True when the shared component directory is complete. */
+    fun sharedReady(): Boolean =
+        sharedRoles.all { File(voicesDir, "$SHARED_VOICE_NAME/$it").isFile }
+
+    /** A voice is playable when its own graphs AND the shared ones exist. */
+    fun isPlayable(voice: Voice): Boolean = sharedReady() &&
+        File(voice.dir, "voice.json").isFile()
 
     /** True when models/ already holds a complete, matching voice layout. */
     fun isStaged(): Boolean =
@@ -83,17 +117,36 @@ class VoiceManager(private val context: Context) {
     }
 
     /**
-     * Stages [voice] into models/. Removes only the files this manager owns
-     * (graphs, voice.json, index, marker) so nothing else in models/ is touched.
+     * Stages [voice] into models/. Links the shared components first (they are
+     * the same for every voice), then the voice-specific graphs and manifest.
+     * Removes only the files this manager owns (graphs, voice.json, index,
+     * marker) so nothing else in models/ is touched.
      * Returns null on success, or the failure reason.
      */
     fun stage(voice: Voice): String? {
         return try {
             if (!modelsDir.isDirectory && !modelsDir.mkdirs())
                 return "cannot create models dir"
+            if (!sharedReady())
+                return "shared components missing — import the shared pack first"
             cleanStaged()
-            val linked = linkOrCopy(voice.dir, modelsDir)
-            if (linked == null) return "cannot link/copy graphs"
+
+            // Shared: link from voices/shared (relative symlink still works,
+            // both live under filesDir).
+            val sharedErr = linkOneOrCopy(
+                File(voicesDir, SHARED_VOICE_NAME), modelsDir, sharedRoles)
+            if (sharedErr != null) return sharedErr
+            // Voice-specific.
+            val voiceErr = linkOneOrCopy(
+                voice.dir, modelsDir,
+                voiceRoles + indexNames.filter { File(voice.dir, it).isFile() })
+            if (voiceErr != null) return voiceErr
+            // Manifest, always named voice.json on the staged side.
+            val manifest = pickManifest(voice.dir) ?: return "voice.json missing"
+            val dst = File(modelsDir, "voice.json")
+            dst.delete()
+            if (!copyFile(manifest, dst)) return "cannot copy manifest"
+
             File(modelsDir, ".voice_name").writeText(voice.name)
             null
         } catch (e: Exception) {
@@ -110,26 +163,25 @@ class VoiceManager(private val context: Context) {
     }
 
     /**
-     * Links each file of [src] into [dst] (preferred) or copies it. Returns the
-     * staging mode used, or null when both fail.
+     * Links the named files of [src] into [dst] (preferred) or copies them.
+     * Files that do not exist in [src] are skipped — the caller passes only
+     * the ones it knows are present. Returns null when every file landed.
      */
-    private fun linkOrCopy(src: File, dst: File): String? {
-        val files = src.listFiles { f -> f.isFile }?.toList() ?: return null
-        // A relative symlink from models/ back to voices/<name>/ — both live
-        // under filesDir, so "../voices/<name>" is the same path from the
-        // perspective of the models/ directory.
+    private fun linkOneOrCopy(src: File, dst: File, names: List<String>): String? {
         val rel = try {
             src.relativeTo(context.filesDir).path
         } catch (e: RuntimeException) {
             null
         }
-        for (f in files) {
-            val target = File(dst, f.name)
+        for (name in names) {
+            val f = File(src, name)
+            if (!f.isFile) continue
+            val target = File(dst, name)
             target.delete()
             val linked = if (rel != null) {
                 try {
                     val ok = Runtime.getRuntime().exec(
-                        arrayOf("ln", "-s", "../$rel/${f.name}", target.absolutePath)
+                        arrayOf("ln", "-s", "../$rel/$name", target.absolutePath)
                     ).waitFor() == 0
                     if (ok) true else { target.delete(); false }
                 } catch (e: Exception) {
@@ -137,10 +189,17 @@ class VoiceManager(private val context: Context) {
                 }
             } else false
             if (!linked) {
-                if (!copyFile(f, target)) return null
+                if (!copyFile(f, target)) return "cannot link or copy $name"
             }
         }
-        return if (files.any { File(dst, it.name).isSymbolicLink() }) "link" else "copy"
+        return null
+    }
+
+    private fun pickManifest(dir: File): File? {
+        val direct = File(dir, "voice.json")
+        if (direct.isFile) return direct
+        return dir.listFiles { f -> f.isFile }
+            ?.firstOrNull { f -> f.name.endsWith("_gate.json") || f.name.endsWith("_manifest.json") }
     }
 
     private fun copyFile(src: File, dst: File): Boolean = try {

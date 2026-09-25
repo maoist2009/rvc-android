@@ -64,6 +64,20 @@
     <string name="settings_models_dir">Models directory</string>
     <string name="settings_voices_dir">Voices directory</string>
 
+    <!-- ====== Settings: import ====== -->
+    <string name="settings_import">Import voice packs</string>
+    <string name="settings_import_hint">Drop packs into the packs directory with a file manager, then rescan. Shared components (HuBERT/RMVPE) are installed once and reused by every voice.</string>
+    <string name="settings_packs_dir">Packs directory</string>
+    <string name="import_rescan">Rescan</string>
+    <string name="import_shared">Shared components (HuBERT, RMVPE)</string>
+    <string name="import_not_found">No pack directory found</string>
+    <string name="import_ready">Ready to install</string>
+    <string name="import_installed">Installed</string>
+    <string name="import_with_index">Ready — %1$s</string>
+    <string name="import_no_voices">No voice packs found under packs/voices/</string>
+    <string name="import_install">Install</string>
+    <string name="import_check">Verify</string>
+
     <!-- ====== Errors ====== -->
     <string name="err_pipeline_init">Pipeline failed to start: %1$s</string>
     <string name="err_no_voice">No voice selected. Add one in Settings.</string>
