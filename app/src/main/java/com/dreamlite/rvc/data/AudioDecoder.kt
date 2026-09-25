@@ -35,6 +35,8 @@ object AudioDecoder {
      */
     fun decodeTo16kMono(src: File): FloatArray? {
         val extractor = MediaExtractor()
+        var codec: MediaCodec? = null
+        var codecStarted = false
         return try {
             extractor.setDataSource(src.absolutePath)
             val track = pickAudioTrack(extractor) ?: run {
@@ -47,7 +49,7 @@ object AudioDecoder {
             val srcRate = inputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
             val srcChannels = inputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
             val mime = inputFormat.getString(MediaFormat.KEY_MIME)!!
-            val codec = try {
+            codec = try {
                 MediaCodec.createDecoderByType(mime)
             } catch (e: Exception) {
                 Log.e(TAG, "no decoder for $mime", e)
@@ -55,6 +57,7 @@ object AudioDecoder {
             }
             codec.configure(inputFormat, null, null, 0)
             codec.start()
+            codecStarted = true
 
             val pcm = ArrayList<Float>(1 shl 18)
             val info = MediaCodec.BufferInfo()
@@ -76,12 +79,14 @@ object AudioDecoder {
                         extractor.advance()
                     }
                 }
+                var sawEOS = false
                 while (true) {
                     val outIdx = codec.dequeueOutputBuffer(info, timeoutUs)
                     when {
                         outIdx >= 0 -> {
                             val outBuf = codec.getOutputBuffer(outIdx)!!
                             appendPcm(outBuf, info, outChannels, pcm)
+                            if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) sawEOS = true
                             codec.releaseOutputBuffer(outIdx, false)
                             if (pcm.size > maxSamples) done = true
                         }
@@ -94,11 +99,12 @@ object AudioDecoder {
                         else -> break
                     }
                 }
-                if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) done = true
+                if (sawEOS || (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) done = true
             }
 
             codec.stop()
             codec.release()
+            codecStarted = false
             extractor.release()
 
             if (pcm.isEmpty()) {
@@ -111,6 +117,12 @@ object AudioDecoder {
         } catch (e: Exception) {
             Log.e(TAG, "decode failed for ${src.name}", e)
             try { extractor.release() } catch (_: Exception) {}
+            // A leaked decoder keeps its hardware session and can poison the
+            // next instance (observed: two concurrent decoders abort).
+            if (codecStarted && codec != null) {
+                try { codec.stop() } catch (_: Exception) {}
+                try { codec.release() } catch (_: Exception) {}
+            }
             null
         }
     }

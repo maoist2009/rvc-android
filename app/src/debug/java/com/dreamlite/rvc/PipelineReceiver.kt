@@ -155,6 +155,10 @@ class PipelineReceiver : BroadcastReceiver() {
 
     private fun runConvert(context: Context, intent: Intent) {
         val app = context.applicationContext as DreamLiteApp
+        if (!converting.compareAndSet(false, true)) {
+            Log.w(TAG, "convert already running, ignoring")
+            return
+        }
         val input = intent.getStringExtra("input") ?: "b8231_in.mp3"
         val outF32 = intent.getStringExtra("output") ?: "convert_out.f32"
         val outWav = intent.getStringExtra("wav") ?: "convert_out.wav"
@@ -207,6 +211,7 @@ class PipelineReceiver : BroadcastReceiver() {
             } catch (t: Throwable) {
                 Log.e(TAG, "convert receiver threw", t)
             } finally {
+                converting.set(false)
                 try { RvcLiveService.stop(context) } catch (t: Throwable) { }
                 pending.finish()
             }
@@ -216,6 +221,7 @@ class PipelineReceiver : BroadcastReceiver() {
     companion object {
         private const val TAG = "rvc_pipeline_test"
         private const val BLOCK = 4000
+        private val converting = java.util.concurrent.atomic.AtomicBoolean(false)
         const val ACTION_PIPELINE = "com.dreamlite.rvc.RUN_PIPELINE"
         const val ACTION_REALTIME = "com.dreamlite.rvc.RUN_REALTIME"
         const val ACTION_CONVERT = "com.dreamlite.rvc.RUN_CONVERT"

@@ -25,6 +25,11 @@ class HomeViewModel(
     private val session = (app as DreamLiteApp).session
     private val settings = (app as DreamLiteApp).settingsRepository
 
+    /** Guards the decode+convert chain: a second pick while the first is
+     * still running would race two MediaCodec instances and abort the
+     * process (observed: libc++abi terminating -> SIGABRT). */
+    private val converting = java.util.concurrent.atomic.AtomicBoolean(false)
+
     val state: StateFlow<RvcState> = session.state
     val level: StateFlow<Float> = session.level
 
@@ -54,25 +59,33 @@ class HomeViewModel(
      * in [session.lastOutput] for playback and saving.
      */
     fun convertOffline(uri: android.net.Uri) {
+        if (!converting.compareAndSet(false, true)) {
+            session.reportError("a conversion is already running")
+            return
+        }
         viewModelScope.launch {
-            val input = withContext(Dispatchers.IO) {
-                val tmp = File(context.cacheDir, "decode_in")
-                context.contentResolver.openInputStream(uri)?.use { i ->
-                    tmp.outputStream().use { o -> i.copyTo(o, 256 * 1024) }
+            try {
+                val input = withContext(Dispatchers.IO) {
+                    val tmp = File(context.cacheDir, "decode_in")
+                    context.contentResolver.openInputStream(uri)?.use { i ->
+                        tmp.outputStream().use { o -> i.copyTo(o, 256 * 1024) }
+                    }
+                    tmp
+                } ?: run {
+                    session.reportError("cannot open the picked file")
+                    return@launch
                 }
-                tmp
-            } ?: run {
-                session.reportError("cannot open the picked file")
-                return@launch
+                val samples = withContext(Dispatchers.Default) {
+                    AudioDecoder.decodeTo16kMono(input) ?: AudioDecoder.readF32(input)
+                }
+                if (samples == null || samples.isEmpty()) {
+                    session.reportError("could not decode ${input.name} (unsupported format?)")
+                    return@launch
+                }
+                session.convertOffline(samples)
+            } finally {
+                converting.set(false)
             }
-            val samples = withContext(Dispatchers.Default) {
-                AudioDecoder.decodeTo16kMono(input) ?: AudioDecoder.readF32(input)
-            }
-            if (samples == null || samples.isEmpty()) {
-                session.reportError("could not decode ${input.name} (unsupported format?)")
-                return@launch
-            }
-            session.convertOffline(samples)
         }
     }
 
