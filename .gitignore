@@ -17,3 +17,9 @@ reference/
 
 # stray clipboard artifacts
 [0-9]*"
+
+# rescued tmp artifacts (large, untracked)
+/salvage/
+
+# ASR model build data (multi-GB; belongs to a separate workspace)
+/tools/

@@ -1,0 +1,11 @@
+The application source in this repository is licensed under GPL-3.0-only
+(see LICENSE).
+
+Third-party components:
+
+- The QNN/HTP runtime libraries under app/src/main/jniLibs are Qualcomm
+  proprietary redistributables. They are not covered by GPL-3.0 and remain
+  subject to the Qualcomm AI Engine Direct SDK license.
+- Voice models imported by the user (RVC v2 checkpoints, retrieval indexes,
+  compiled QNN graphs) are not part of this repository and retain the terms
+  of their upstream providers.
