@@ -3,6 +3,26 @@
     <!-- ====== App ====== -->
     <string name="app_name">DreamLite RVC</string>
 
+    <!-- ====== Top bar ====== -->
+    <string name="top_title">DreamLite RVC</string>
+    <string name="top_voice_none">no voice selected</string>
+
+    <!-- ====== Status strip ====== -->
+    <string name="status_ready">Ready</string>
+    <string name="status_retrieval_on">retrieval on (%1$.2f)</string>
+    <string name="status_retrieval_off">retrieval off</string>
+    <string name="home_index_rate">Index blend</string>
+    <string name="home_pitch">Pitch</string>
+    <string name="home_pitch_value">%1$+d st</string>
+    <string name="home_rms_mix_rate">Loudness mix</string>
+    <string name="home_rms_mix_rate_value">%1$.2f</string>
+    <string name="home_protect">Protect</string>
+    <string name="home_protect_value">%1$.2f</string>
+    <string name="home_filter_radius">F0 smoothing</string>
+    <string name="home_filter_radius_value">%1$d</string>
+    <string name="home_f0_margin">Realtime F0 lookahead</string>
+    <string name="home_f0_margin_hint">Off: lowest latency. On: steadier block-tail f0 (+100 ms).</string>
+
     <!-- ====== Navigation ====== -->
     <string name="nav_home">Home</string>
     <string name="nav_settings">Settings</string>
@@ -13,12 +33,46 @@
     <string name="home_status_running">Converting</string>
     <string name="home_record">Record</string>
     <string name="home_stop">Stop</string>
+    <string name="home_stop_playback">Stop playback</string>
     <string name="home_recorded">Recorded</string>
     <string name="home_play_original">Play original</string>
     <string name="home_play_converted">Play converted</string>
     <string name="home_save_wav">Save WAV</string>
     <string name="home_no_input">No recording yet</string>
     <string name="home_no_output">Run a conversion first</string>
+    <string name="home_level">Input level</string>
+
+    <!-- ====== Single-page workflow ====== -->
+    <string name="home_ready">Ready</string>
+    <string name="home_live_hint">Tap the mic and speak — the converted voice plays back live.</string>
+    <string name="home_tap_stop">Tap to stop</string>
+    <string name="home_voice_change">Change</string>
+    <string name="home_voice_none">No voice selected</string>
+    <string name="home_voice_none_hint">Add a voice pack in Settings to begin.</string>
+    <string name="home_import_audio">Import audio</string>
+    <string name="home_parameters">Parameters</string>
+    <string name="home_result">Result</string>
+    <string name="home_result_empty">Converted audio from the mic or an imported clip appears here.</string>
+    <string name="home_result_meta">%1$.1f s · %2$d Hz</string>
+    <string name="home_details">Runtime details</string>
+    <string name="home_mic_needed">Microphone access needed</string>
+    <string name="home_mic_needed_hint">Tap to grant access. Conversion parameters stay editable meanwhile.</string>
+    <string name="home_pitch_decrease">Lower pitch</string>
+    <string name="home_pitch_increase">Raise pitch</string>
+    <string name="home_monitor">Hear converted audio</string>
+    <string name="home_monitor_hint">Use headphones — the speaker feeds back into the mic.</string>
+    <string name="home_open_settings">Settings</string>
+    <string name="home_back">Back</string>
+
+    <string name="params_title">Conversion parameters</string>
+    <string name="params_hint">Live pitch applies instantly; retrieval changes reload the graphs on the next run.</string>
+    <string name="params_reset">Reset to defaults</string>
+    <string name="params_index_off">Retrieval off</string>
+    <string name="params_index_on">%1$.2f blend</string>
+
+    <string name="voice_sheet_title">Voice</string>
+    <string name="voice_sheet_manage">Manage voices and packs</string>
+    <string name="voice_no_index">no index — retrieval off</string>
 
     <string name="convert_title">Convert an audio file</string>
     <string name="convert_pick">Pick audio (mp3, m4a, wav…)</string>

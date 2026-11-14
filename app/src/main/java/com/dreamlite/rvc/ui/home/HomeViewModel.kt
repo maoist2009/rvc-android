@@ -8,10 +8,12 @@ import androidx.lifecycle.viewModelScope
 import com.dreamlite.rvc.DreamLiteApp
 import com.dreamlite.rvc.data.AudioDecoder
 import com.dreamlite.rvc.data.SettingsRepository
+import com.dreamlite.rvc.data.VoiceManager
 import com.dreamlite.rvc.engine.RvcState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -22,8 +24,9 @@ class HomeViewModel(
 ) : AndroidViewModel(app) {
 
     private val context = app.applicationContext
-    private val session = (app as DreamLiteApp).session
-    private val settings = (app as DreamLiteApp).settingsRepository
+    private val appInstance = app as DreamLiteApp
+    private val session = appInstance.session
+    private val settingsRepo = appInstance.settingsRepository
 
     /** Guards the decode+convert chain: a second pick while the first is
      * still running would race two MediaCodec instances and abort the
@@ -32,6 +35,34 @@ class HomeViewModel(
 
     val state: StateFlow<RvcState> = session.state
     val level: StateFlow<Float> = session.level
+    val isPlaying: StateFlow<Boolean> = session.isPlaying
+    val settings: StateFlow<SettingsRepository.Settings> =
+        settingsRepo.settingsFlow.stateIn(
+            viewModelScope, kotlinx.coroutines.flow.SharingStarted.Eagerly,
+            SettingsRepository.DEFAULTS,
+        )
+
+    /** Voices visible to the inline picker, so choosing one never requires a
+     * trip through Settings. */
+    val voices: StateFlow<List<VoiceManager.Voice>> =
+        appInstance.voiceManager.voicesFlow.stateIn(
+            viewModelScope, kotlinx.coroutines.flow.SharingStarted.Eagerly, emptyList(),
+        )
+
+    /** True while a converted buffer exists for the result card. */
+    fun hasOutput(): Boolean = session.lastOutput != null
+
+    /** Sample rate of the staged voice, so the result card reports the real
+     * duration instead of assuming 40 kHz. */
+    fun sampleRate(): Int = session.voiceSr
+
+    fun setVoice(name: String) {
+        viewModelScope.launch { settingsRepo.setVoiceName(name) }
+    }
+
+    fun setMonitor(on: Boolean) {
+        viewModelScope.launch { settingsRepo.setMonitor(on) }
+    }
 
     init {
         // preload the pipeline as soon as the screen exists so the first
@@ -41,16 +72,65 @@ class HomeViewModel(
 
     fun startLive() {
         viewModelScope.launch {
-            val s = settings.settingsFlow.let { it }
-            val monitor = true
-            session.startLive(monitor)
+            val s = settingsRepo.settingsFlow.first()
+            session.startLive(s.monitor)
         }
     }
 
     fun stop() = session.stop()
 
+    /**
+     * Persists the transpose and pushes it to the live pipeline: the next
+     * emitted block uses it, without the full reload an index change needs.
+     */
+    fun setPitchSemitones(semitones: Float) {
+        viewModelScope.launch {
+            settingsRepo.setPitchSemitones(semitones)
+            session.setPitch(semitones)
+        }
+    }
+
+    /** The three official RVC tunables — same persist + push contract. */
+    fun setRmsMixRate(rate: Float) {
+        viewModelScope.launch {
+            settingsRepo.setRmsMixRate(rate)
+            session.setRmsMixRate(rate)
+        }
+    }
+
+    fun setProtect(protect: Float) {
+        viewModelScope.launch {
+            settingsRepo.setProtect(protect)
+            session.setProtect(protect)
+        }
+    }
+
+    fun setFilterRadius(radius: Int) {
+        viewModelScope.launch {
+            settingsRepo.setFilterRadius(radius)
+            session.setFilterRadius(radius)
+        }
+    }
+
+    /**
+     * Realtime f0 lookahead: 0 = earliest window (low latency), 1 = one extra
+     * 100 ms window (steadier block-tail f0). Persist + push, like pitch.
+     */
+    fun setF0Margin(margin: Int) {
+        viewModelScope.launch {
+            settingsRepo.setF0Margin(margin)
+            session.setF0Margin(margin)
+        }
+    }
+
     fun playConverted() {
         viewModelScope.launch { session.playLast() }
+    }
+
+    fun stopPlaying() = session.stopPlay()
+
+    fun setIndexRate(rate: Float) {
+        viewModelScope.launch { settingsRepo.setIndexRate(rate) }
     }
 
     /**

@@ -62,6 +62,7 @@ class DreamLiteApp : Application() {
 
     val session: RvcSession by lazy {
         RvcSession(
+            appContext = this,
             voiceManager = voiceManager,
             settings = settingsRepository,
             libDir = appNativeLibDir,
