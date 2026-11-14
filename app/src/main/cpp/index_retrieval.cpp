@@ -231,69 +231,95 @@ static inline float sqdist768(const float *a, const float *b) {
 /* (nq x d) @ (d x nc) -> (nq x nc), row-major out.  B is stored as (nc, d)
  * rows, i.e. the product is A @ B^T.  4x4 tiles so each B row is loaded once
  * per four queries instead of once per query; d is a multiple of 4 so the
- * inner loop has no tail. */
+ * inner loop has no tail.
+ *
+ * Loop nesting: B (the centroid matrix, nc*d up to ~4.2 MB) is walked once
+ * per call and A (the queries, nq*d ~0.4 MB, L2-resident) is re-streamed for
+ * every centroid slab.  Walking A once and re-reading B instead makes B
+ * stream from DRAM once per query group, which on this workload costs more
+ * than re-streaming the smaller A from L2.  The per-(i,j) dot product's
+ * accumulation order is unchanged, so the output is bit-exact either way. */
 static void gemm_at(const float *A, size_t nq, const float *B, size_t nc,
                     size_t d, float *out) {
   const size_t nc4 = nc & ~(size_t)3;
-  size_t i = 0;
-  for (; i + 4 <= nq; i += 4) {
-    const float *a0 = A + i * d, *a1 = a0 + d, *a2 = a1 + d, *a3 = a2 + d;
-    float *o0 = out + i * nc, *o1 = o0 + nc, *o2 = o1 + nc, *o3 = o2 + nc;
-    for (size_t j = 0; j < nc4; j += 4) {
-      float32x4_t a00 = vdupq_n_f32(0), a01 = vdupq_n_f32(0),
-                  a02 = vdupq_n_f32(0), a03 = vdupq_n_f32(0);
-      float32x4_t a10 = vdupq_n_f32(0), a11 = vdupq_n_f32(0),
-                  a12 = vdupq_n_f32(0), a13 = vdupq_n_f32(0);
-      float32x4_t a20 = vdupq_n_f32(0), a21 = vdupq_n_f32(0),
-                  a22 = vdupq_n_f32(0), a23 = vdupq_n_f32(0);
-      float32x4_t a30 = vdupq_n_f32(0), a31 = vdupq_n_f32(0),
-                  a32 = vdupq_n_f32(0), a33 = vdupq_n_f32(0);
-      for (size_t t = 0; t < d; t += 4) {
-        float32x4_t q0 = vld1q_f32(a0 + t), q1 = vld1q_f32(a1 + t),
-                    q2 = vld1q_f32(a2 + t), q3 = vld1q_f32(a3 + t);
-        float32x4_t b0 = vld1q_f32(B + j * d + t),
-                    b1 = vld1q_f32(B + (j + 1) * d + t),
-                    b2 = vld1q_f32(B + (j + 2) * d + t),
-                    b3 = vld1q_f32(B + (j + 3) * d + t);
-        a00 = vfmaq_f32(a00, q0, b0); a01 = vfmaq_f32(a01, q0, b1);
-        a02 = vfmaq_f32(a02, q0, b2); a03 = vfmaq_f32(a03, q0, b3);
-        a10 = vfmaq_f32(a10, q1, b0); a11 = vfmaq_f32(a11, q1, b1);
-        a12 = vfmaq_f32(a12, q1, b2); a13 = vfmaq_f32(a13, q1, b3);
-        a20 = vfmaq_f32(a20, q2, b0); a21 = vfmaq_f32(a21, q2, b1);
-        a22 = vfmaq_f32(a22, q2, b2); a23 = vfmaq_f32(a23, q2, b3);
-        a30 = vfmaq_f32(a30, q3, b0); a31 = vfmaq_f32(a31, q3, b1);
-        a32 = vfmaq_f32(a32, q3, b2); a33 = vfmaq_f32(a33, q3, b3);
+
+  /* Outer slab over B: JB consecutive centroid rows stay in L1 while every
+   * query group streams past them, so B is fetched from DRAM once per call
+   * instead of once per query group (nq/4 = 35 passes).  A (nq*d ~0.4 MB)
+   * is L2-resident, so re-streaming it per slab is cheap.  JB=8 keeps the
+   * slab at 8*768*4 = 24 KB, which fits the 64 KB L1D alongside one 12 KB
+   * query group. */
+  constexpr size_t JB = 8;
+
+  for (size_t j0 = 0; j0 < nc4; j0 += JB) {
+    const size_t je = (j0 + JB < nc4) ? j0 + JB : nc4;
+    for (size_t i = 0; i + 4 <= nq; i += 4) {
+      const float *a0 = A + i * d, *a1 = a0 + d, *a2 = a1 + d, *a3 = a2 + d;
+      float *o0 = out + i * nc, *o1 = o0 + nc, *o2 = o1 + nc, *o3 = o2 + nc;
+      for (size_t j = j0; j + 4 <= je; j += 4) {
+        float32x4_t a00 = vdupq_n_f32(0), a01 = vdupq_n_f32(0),
+                    a02 = vdupq_n_f32(0), a03 = vdupq_n_f32(0);
+        float32x4_t a10 = vdupq_n_f32(0), a11 = vdupq_n_f32(0),
+                    a12 = vdupq_n_f32(0), a13 = vdupq_n_f32(0);
+        float32x4_t a20 = vdupq_n_f32(0), a21 = vdupq_n_f32(0),
+                    a22 = vdupq_n_f32(0), a23 = vdupq_n_f32(0);
+        float32x4_t a30 = vdupq_n_f32(0), a31 = vdupq_n_f32(0),
+                    a32 = vdupq_n_f32(0), a33 = vdupq_n_f32(0);
+        for (size_t t = 0; t < d; t += 4) {
+          float32x4_t q0 = vld1q_f32(a0 + t), q1 = vld1q_f32(a1 + t),
+                      q2 = vld1q_f32(a2 + t), q3 = vld1q_f32(a3 + t);
+          float32x4_t b0 = vld1q_f32(B + j * d + t),
+                      b1 = vld1q_f32(B + (j + 1) * d + t),
+                      b2 = vld1q_f32(B + (j + 2) * d + t),
+                      b3 = vld1q_f32(B + (j + 3) * d + t);
+          a00 = vfmaq_f32(a00, q0, b0); a01 = vfmaq_f32(a01, q0, b1);
+          a02 = vfmaq_f32(a02, q0, b2); a03 = vfmaq_f32(a03, q0, b3);
+          a10 = vfmaq_f32(a10, q1, b0); a11 = vfmaq_f32(a11, q1, b1);
+          a12 = vfmaq_f32(a12, q1, b2); a13 = vfmaq_f32(a13, q1, b3);
+          a20 = vfmaq_f32(a20, q2, b0); a21 = vfmaq_f32(a21, q2, b1);
+          a22 = vfmaq_f32(a22, q2, b2); a23 = vfmaq_f32(a23, q2, b3);
+          a30 = vfmaq_f32(a30, q3, b0); a31 = vfmaq_f32(a31, q3, b1);
+          a32 = vfmaq_f32(a32, q3, b2); a33 = vfmaq_f32(a33, q3, b3);
+        }
+        /* each accumulator's lanes hold partial sums over disjoint dim
+         * ranges, so the dot is the horizontal sum of its 4 lanes */
+        o0[j] = vaddvq_f32(a00); o0[j + 1] = vaddvq_f32(a01);
+        o0[j + 2] = vaddvq_f32(a02); o0[j + 3] = vaddvq_f32(a03);
+        o1[j] = vaddvq_f32(a10); o1[j + 1] = vaddvq_f32(a11);
+        o1[j + 2] = vaddvq_f32(a12); o1[j + 3] = vaddvq_f32(a13);
+        o2[j] = vaddvq_f32(a20); o2[j + 1] = vaddvq_f32(a21);
+        o2[j + 2] = vaddvq_f32(a22); o2[j + 3] = vaddvq_f32(a23);
+        o3[j] = vaddvq_f32(a30); o3[j + 1] = vaddvq_f32(a31);
+        o3[j + 2] = vaddvq_f32(a32); o3[j + 3] = vaddvq_f32(a33);
       }
-      /* each accumulator's lanes hold partial sums over disjoint dim ranges,
-       * so the dot is the horizontal sum of its 4 lanes */
-      o0[j] = vaddvq_f32(a00); o0[j + 1] = vaddvq_f32(a01);
-      o0[j + 2] = vaddvq_f32(a02); o0[j + 3] = vaddvq_f32(a03);
-      o1[j] = vaddvq_f32(a10); o1[j + 1] = vaddvq_f32(a11);
-      o1[j + 2] = vaddvq_f32(a12); o1[j + 3] = vaddvq_f32(a13);
-      o2[j] = vaddvq_f32(a20); o2[j + 1] = vaddvq_f32(a21);
-      o2[j + 2] = vaddvq_f32(a22); o2[j + 3] = vaddvq_f32(a23);
-      o3[j] = vaddvq_f32(a30); o3[j + 1] = vaddvq_f32(a31);
-      o3[j + 2] = vaddvq_f32(a32); o3[j + 3] = vaddvq_f32(a33);
     }
-    for (size_t j = nc4; j < nc; j++) {
-      const float *b = B + j * d;
-      float32x4_t s0 = vdupq_n_f32(0), s1 = vdupq_n_f32(0),
-                  s2 = vdupq_n_f32(0), s3 = vdupq_n_f32(0);
-      for (size_t t = 0; t < d; t += 4) {
-        float32x4_t bv = vld1q_f32(b + t);
-        s0 = vfmaq_f32(s0, vld1q_f32(a0 + t), bv);
-        s1 = vfmaq_f32(s1, vld1q_f32(a1 + t), bv);
-        s2 = vfmaq_f32(s2, vld1q_f32(a2 + t), bv);
-        s3 = vfmaq_f32(s3, vld1q_f32(a3 + t), bv);
+    /* query tail for this slab (nq is a multiple of 4 for the realtime
+     * layout, so this is only reached for degenerate shapes) */
+    for (size_t i = nq & ~(size_t)3; i < nq; i++) {
+      const float *a = A + i * d;
+      float *o = out + i * nc;
+      for (size_t j = j0; j + 4 <= je; j += 4) {
+        float32x4_t s0 = vdupq_n_f32(0), s1 = vdupq_n_f32(0),
+                    s2 = vdupq_n_f32(0), s3 = vdupq_n_f32(0);
+        for (size_t t = 0; t < d; t += 4) {
+          float32x4_t av = vld1q_f32(a + t);
+          s0 = vfmaq_f32(s0, av, vld1q_f32(B + j * d + t));
+          s1 = vfmaq_f32(s1, av, vld1q_f32(B + (j + 1) * d + t));
+          s2 = vfmaq_f32(s2, av, vld1q_f32(B + (j + 2) * d + t));
+          s3 = vfmaq_f32(s3, av, vld1q_f32(B + (j + 3) * d + t));
+        }
+        o[j] = vaddvq_f32(s0); o[j + 1] = vaddvq_f32(s1);
+        o[j + 2] = vaddvq_f32(s2); o[j + 3] = vaddvq_f32(s3);
       }
-      o0[j] = vaddvq_f32(s0); o1[j] = vaddvq_f32(s1);
-      o2[j] = vaddvq_f32(s2); o3[j] = vaddvq_f32(s3);
     }
   }
-  for (; i < nq; i++) {
+
+  /* centroid tail: the last nc % 4 columns are not 4-aligned, so they are
+   * covered once, after the slabs.  At most 3 columns, so a plain loop. */
+  for (size_t i = 0; i < nq; i++) {
     const float *a = A + i * d;
     float *o = out + i * nc;
-    for (size_t j = 0; j < nc; j++) {
+    for (size_t j = nc4; j < nc; j++) {
       const float *b = B + j * d;
       float32x4_t s = vdupq_n_f32(0);
       for (size_t t = 0; t < d; t += 4)
