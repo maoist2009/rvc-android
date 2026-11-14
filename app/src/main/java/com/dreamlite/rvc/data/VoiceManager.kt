@@ -65,6 +65,9 @@ class VoiceManager(private val context: Context) {
         "conv0_gn.f32",
     )
 
+    /** Guards [stage] against concurrent callers. */
+    private val stageLock = Any()
+
     private val _voicesFlow = MutableStateFlow<List<Voice>>(emptyList())
     /** The voice list as a flow; refreshed by [rescan] and on first access. */
     val voicesFlow: StateFlow<List<Voice>> = _voicesFlow.asStateFlow()
@@ -122,8 +125,15 @@ class VoiceManager(private val context: Context) {
      * Removes only the files this manager owns (graphs, voice.json, index,
      * marker) so nothing else in models/ is touched.
      * Returns null on success, or the failure reason.
+     *
+     * Serialised: two callers racing (HomeViewModel's init and a conversion
+     * start) would otherwise interleave clean/link/copy and leave one voice's
+     * graphs under another voice's manifest. The marker is written last, so a
+     * crash mid-way leaves the layout visibly unstaged.
      */
-    fun stage(voice: Voice): String? {
+    fun stage(voice: Voice): String? = synchronized(stageLock) { stageLocked(voice) }
+
+    private fun stageLocked(voice: Voice): String? {
         return try {
             if (!modelsDir.isDirectory && !modelsDir.mkdirs())
                 return "cannot create models dir"
@@ -151,9 +161,30 @@ class VoiceManager(private val context: Context) {
             if (!copyFile(manifest, dst)) return "cannot copy manifest"
 
             File(modelsDir, ".voice_name").writeText(voice.name)
+            if (!stagedMatches(voice))
+                return "staged layout does not match ${voice.name}"
             null
         } catch (e: Exception) {
             e.message ?: e.javaClass.simpleName
+        }
+    }
+
+    /**
+     * True when models/ reflects exactly [voice]: the marker names it and every
+     * voice graph either is a copy or a link resolving into its folder. Catches
+     * the mixed layout a crash or a racing [stage] can leave behind.
+     */
+    fun stagedMatches(voice: Voice): Boolean {
+        if (stagedVoiceName() != voice.name) return false
+        return try {
+            voiceRoles.all { name ->
+                val staged = File(modelsDir, name)
+                staged.isFile &&
+                    (!staged.isSymbolicLink() ||
+                        staged.canonicalFile == File(voice.dir, name).canonicalFile)
+            }
+        } catch (e: Exception) {
+            false
         }
     }
 
