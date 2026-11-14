@@ -68,6 +68,14 @@ JNI_FUNC(jstring, loadGraph)(JNIEnv *env, jobject, jstring tag, jstring binPath)
   return env->NewStringUTF("");
 }
 
+JNI_FUNC(jstring, loadGraphDlc)(JNIEnv *env, jobject, jstring tag, jstring dlcPath) {
+  std::string t = jstr(env, tag);
+  std::string p = jstr(env, dlcPath);
+  if (qnn_load_dlc(t.c_str(), p.c_str()) != 0)
+    return env->NewStringUTF(qnn_last_error());
+  return env->NewStringUTF("");
+}
+
 JNI_FUNC(jstring, freeGraph)(JNIEnv *env, jobject, jstring tag) {
   std::string t = jstr(env, tag);
   if (qnn_free(t.c_str()) != 0)
@@ -78,7 +86,9 @@ JNI_FUNC(jstring, freeGraph)(JNIEnv *env, jobject, jstring tag) {
 JNI_FUNC(jstring, graphInfo)(JNIEnv *env, jobject, jstring tag) {
   std::string t = jstr(env, tag);
   JsonCtx in, out;
-  if (qnn_describe(t.c_str(), emit_tensor, emit_tensor, &in) != 0)
+  /* in_cb only — passing emit_tensor for out_cb too would append the outputs
+   * to the "inputs" array, and every consumer would over-feed the graph. */
+  if (qnn_describe(t.c_str(), emit_tensor, nullptr, &in) != 0)
     return env->NewStringUTF(qnn_last_error());
   if (qnn_describe(t.c_str(), nullptr, emit_tensor, &out) != 0)
     return env->NewStringUTF(qnn_last_error());
@@ -212,6 +222,7 @@ JNI_FUNC(jstring, pipelineInit)(JNIEnv *env, jobject, jstring modelsDir,
   v.sine_amp = 0.1f;
   v.index_rate = 0.0f;    /* no .index staged -> retrieval off */
   v.nprobe = 0;           /* 0 = the value stored in the .index file */
+  v.pitch_mult = 1.0;     /* no transpose until the user sets one */
 
   /* the voice parameters come from the voice's manifest; absent keys keep the
    * defaults above, which match the v2 40k voice used during bring-up. */
@@ -238,6 +249,13 @@ JNI_FUNC(jstring, pipelineInit)(JNIEnv *env, jobject, jstring modelsDir,
   if ((val = find_num("sine_amp")) != HUGE_VAL) v.sine_amp = (float)val;
   if ((val = find_num("index_rate")) != HUGE_VAL) v.index_rate = (float)val;
   if ((val = find_num("nprobe")) != HUGE_VAL) v.nprobe = (int)val;
+  v.rms_mix_rate = 0.25;           /* official default until the manifest says otherwise */
+  v.protect = 0.5;                 /* 0.5 = off in the official client */
+  v.filter_radius = 3;
+  v.f0_margin = 0;                 /* realtime: earliest f0 window (low latency) */
+  if ((val = find_num("rms_mix_rate")) != HUGE_VAL) v.rms_mix_rate = val;
+  if ((val = find_num("protect")) != HUGE_VAL) v.protect = val;
+  if ((val = find_num("filter_radius")) != HUGE_VAL) v.filter_radius = (int)val;
 
   /* index_rate > 0 turns on the retrieval step; the index file is resolved
    * relative to the models dir. */
@@ -248,6 +266,43 @@ JNI_FUNC(jstring, pipelineInit)(JNIEnv *env, jobject, jstring modelsDir,
 
   if (rvc_pipeline_init(g_pipeline, dir.c_str(), lib.c_str(), &v) != 0)
     return env->NewStringUTF(rvc_pipeline_last_error(g_pipeline));
+  return env->NewStringUTF("");
+}
+
+/* Runtime pitch transpose in semitones; "" on success. Takes effect on the
+ * next emitted block — no graph reload, unlike an index_rate change. */
+JNI_FUNC(jstring, pipelineSetPitch)(JNIEnv *env, jobject, jfloat semitones) {
+  if (!g_pipeline) return env->NewStringUTF("no pipeline");
+  rvc_pipeline_set_pitch(g_pipeline, (double)semitones);
+  return env->NewStringUTF("");
+}
+
+/* Runtime overrides for the three official tunables; like pitch they apply
+ * to the next emitted block without a graph reload. */
+JNI_FUNC(jstring, pipelineSetRmsMixRate)(JNIEnv *env, jobject, jfloat rate) {
+  if (!g_pipeline) return env->NewStringUTF("no pipeline");
+  rvc_pipeline_set_rms_mix_rate(g_pipeline, (double)rate);
+  return env->NewStringUTF("");
+}
+
+JNI_FUNC(jstring, pipelineSetProtect)(JNIEnv *env, jobject, jfloat protect) {
+  if (!g_pipeline) return env->NewStringUTF("no pipeline");
+  rvc_pipeline_set_protect(g_pipeline, (double)protect);
+  return env->NewStringUTF("");
+}
+
+JNI_FUNC(jstring, pipelineSetFilterRadius)(JNIEnv *env, jobject, jint radius) {
+  if (!g_pipeline) return env->NewStringUTF("no pipeline");
+  rvc_pipeline_set_filter_radius(g_pipeline, (int)radius);
+  return env->NewStringUTF("");
+}
+
+/* Realtime f0 lookahead margin: 0 = earliest 100 ms window (low latency),
+ * 1 = one window later (steadier block-tail f0, +100 ms). Applies to the
+ * next blocks; no graph reload, like pitch. */
+JNI_FUNC(jstring, pipelineSetF0Margin)(JNIEnv *env, jobject, jint margin) {
+  if (!g_pipeline) return env->NewStringUTF("no pipeline");
+  rvc_pipeline_set_f0_margin(g_pipeline, (int)margin);
   return env->NewStringUTF("");
 }
 
@@ -275,8 +330,13 @@ JNI_FUNC(jfloatArray, pipelineConvert)(JNIEnv *env, jobject, jfloatArray inAudio
 JNI_FUNC(jstring, pipelineStats)(JNIEnv *env, jobject) {
   if (!g_pipeline) return env->NewStringUTF("{}");
   const rvc_stats_t *s = rvc_pipeline_stats(g_pipeline);
-  char buf[1024];
-  snprintf(buf, sizeof(buf),
+  /* The dbg queue dump runs to several KB on a long convert, so size the
+   * buffer from the actual string instead of truncating mid-JSON (which
+   * made the Kotlin parser fall back to rtf=1). */
+  std::string js;
+  js.reserve(512 + strlen(s->dbg));
+  char head[512];
+  int n = snprintf(head, sizeof(head),
            "{\"ms_total\":%.1f,\"ms_init\":%.1f,\"ms_highpass\":%.1f,"
            "\"ms_f0\":%.1f,\"ms_c0\":%.1f,\"ms_gn\":%.1f,\"ms_r\":%.1f,"
            "\"ms_enc\":%.1f,\"ms_synth\":%.1f,\"ms_sola\":%.1f,\"ms_rms\":%.1f,"
@@ -284,14 +344,29 @@ JNI_FUNC(jstring, pipelineStats)(JNIEnv *env, jobject) {
            "\"n_blocks\":%ld,\"n_in\":%ld,\"n_out\":%ld,\"graph_calls\":%ld,"
            "\"rtf\":%.3f,\"next_block\":%d,\"next_prep\":%d,\"n_real\":%ld,"
            "\"f0_windows\":%ld,\"f0_folded\":%ld,\"q_next\":%llu,\"q_done\":%llu,"
-           "\"q_fail\":%d,\"q_workers\":%d,\"dbg\":\"%s\"}",
+           "\"q_fail\":%d,\"q_workers\":%d,\"dbg\":\"",
            s->ms_total, s->ms_init, s->ms_highpass, s->ms_f0, s->ms_c0,
            s->ms_gn, s->ms_r, s->ms_enc, s->ms_synth, s->ms_sola, s->ms_rms,
            s->ms_index,
            s->n_blocks, s->n_in, s->n_out, s->graph_calls, s->rtf,
            s->next_block, s->next_prep, s->n_real, s->f0_windows, s->f0_folded,
-           s->q_next, s->q_done, s->q_fail, s->q_workers, s->dbg);
-  return env->NewStringUTF(buf);
+           s->q_next, s->q_done, s->q_fail, s->q_workers);
+  if (n <= 0) return env->NewStringUTF("{}");
+  js.append(head, (size_t)n);
+  /* Escape what JSON requires, so a stray quote in the dump cannot end the
+   * string early either. */
+  for (const char *c = s->dbg; *c; c++) {
+    switch (*c) {
+      case '"': js += "\\\""; break;
+      case '\\': js += "\\\\"; break;
+      case '\n': js += "\\n"; break;
+      case '\r': js += "\\r"; break;
+      case '\t': js += "\\t"; break;
+      default: js += *c;
+    }
+  }
+  js += "\"}";
+  return env->NewStringUTF(js.c_str());
 }
 
 JNI_FUNC(void, pipelineDestroy)(JNIEnv *, jobject) {

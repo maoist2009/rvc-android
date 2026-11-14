@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -25,6 +26,7 @@
 
 #include "QnnInterface.h"
 #include "System/QnnSystemContext.h"
+#include "System/QnnSystemDlc.h"
 #include "System/QnnSystemInterface.h"
 #include "HTP/QnnHtpDevice.h"
 #include "HTP/QnnHtpPerfInfrastructure.h"
@@ -32,7 +34,9 @@
 #define TAG "rvc_native"
 
 #define MAX_GRAPHS  16
-#define MAX_TENSORS 16
+/* The ASR decoder parts carry one past/present pair per layer (10 layers =>
+ * 4 + 20 = 24 inputs, 21 outputs); 16 was tuned for the RVC graphs only. */
+#define MAX_TENSORS 64
 #define NAME_LEN    128
 #define ERR_LEN     1024
 
@@ -89,6 +93,7 @@ struct graph {
   int      fd;
   void    *map;
   size_t   map_len;
+  QnnSystemDlc_Handle_t dlc;   /* nonzero when loaded from a .dlc file */
   Qnn_ContextHandle_t ctx;
   Qnn_GraphHandle_t    g;
   uint32_t n_in, n_out;
@@ -115,8 +120,65 @@ static size_t dtype_bytes(Qnn_DataType_t dt, size_t elems) {
     case QNN_DATATYPE_INT_32:
     case QNN_DATATYPE_UINT_32:
       return elems * 4;
+    case QNN_DATATYPE_FLOAT_16:
+    case QNN_DATATYPE_INT_16:
+    case QNN_DATATYPE_UINT_16:
+    case QNN_DATATYPE_SFIXED_POINT_16:
+    case QNN_DATATYPE_UFIXED_POINT_16:
+      return elems * 2;
+    case QNN_DATATYPE_INT_8:
+    case QNN_DATATYPE_UINT_8:
+    case QNN_DATATYPE_BOOL_8:
+    case QNN_DATATYPE_SFIXED_POINT_8:
+    case QNN_DATATYPE_UFIXED_POINT_8:
+      return elems;
     default:
       return 0;   /* unsupported at the boundary — refuse, never miscast */
+  }
+}
+
+/* QNN dtype -> the coarse RVC_QNN_* code the JNI layer compares against.
+ * Quantized storage types collapse to their width: int8-fixed and uint8-fixed
+ * differ only in the zero point, which the graph applies itself. */
+static int rvc_dtype_of(Qnn_DataType_t dt) {
+  switch (dt) {
+    case QNN_DATATYPE_FLOAT_32:
+      return RVC_QNN_FLOAT32;
+    case QNN_DATATYPE_FLOAT_16:
+      return RVC_QNN_FLOAT16;
+    case QNN_DATATYPE_INT_32:
+    case QNN_DATATYPE_UINT_32:
+      return RVC_QNN_INT32;
+    case QNN_DATATYPE_INT_16:
+    case QNN_DATATYPE_UINT_16:
+    case QNN_DATATYPE_SFIXED_POINT_16:
+    case QNN_DATATYPE_UFIXED_POINT_16:
+      return RVC_QNN_INT16;
+    case QNN_DATATYPE_INT_8:
+    case QNN_DATATYPE_SFIXED_POINT_8:
+      return RVC_QNN_INT8;
+    case QNN_DATATYPE_UINT_8:
+    case QNN_DATATYPE_BOOL_8:
+    case QNN_DATATYPE_UFIXED_POINT_8:
+      return RVC_QNN_UINT8;
+    default:
+      return -1;
+  }
+}
+
+size_t qnn_elem_size(int dtype) {
+  switch (dtype) {
+    case RVC_QNN_FLOAT32:
+    case RVC_QNN_INT32:
+      return 4;
+    case RVC_QNN_FLOAT16:
+    case RVC_QNN_INT16:
+      return 2;
+    case RVC_QNN_INT8:
+    case RVC_QNN_UINT8:
+      return 1;
+    default:
+      return 0;
   }
 }
 
@@ -125,6 +187,28 @@ static void free_graph(struct graph *g) {
   if (g->g) IF.graphFinalize(g->g, NULL, NULL);
   if (g->ctx) IF.contextFree(g->ctx, NULL);
 #undef IF
+  if (g->dlc) {
+    /* the DLC owns the weight memory the context's graphs reference, so it
+     * must outlive the contextFree above */
+    void *sh = dlopen("libQnnSystem.so", RTLD_NOW);
+    if (sh) {
+      Qnn_ErrorHandle_t (*sysGetProviders)(const QnnSystemInterface_t ***, uint32_t *) =
+          (Qnn_ErrorHandle_t(*)(const QnnSystemInterface_t ***, uint32_t *))
+              dlsym(sh, "QnnSystemInterface_getProviders");
+      const QnnSystemInterface_t **list = NULL;
+      uint32_t n = 0;
+      if (sysGetProviders && !sysGetProviders(&list, &n)) {
+        for (uint32_t i = 0; i < n; i++)
+          if (list[i]->systemApiVersion.major == QNN_SYSTEM_API_VERSION_MAJOR &&
+              list[i]->systemApiVersion.minor >= QNN_SYSTEM_API_VERSION_MINOR &&
+              list[i]->v1_9.systemDlcFree) {
+            list[i]->v1_9.systemDlcFree(g->dlc);
+            break;
+          }
+      }
+    }
+    g->dlc = 0;
+  }
   if (g->map && g->map != MAP_FAILED) munmap(g->map, g->map_len);
   if (g->fd >= 0) close(g->fd);
   for (uint32_t i = 0; i < g->n_in; i++) free(g->in[i].buf);
@@ -381,6 +465,24 @@ int qnn_init(const char *lib_dir, const char *skel_dir) {
   return 0;
 }
 
+/* Bind the graph descriptors from a system GraphInfoV1 into the slot's tensor
+ * tables. Shared by the .bin and .dlc loaders — both produce the same
+ * QnnSystemContext_GraphInfo_t, only the graph/context provenance differs. */
+static int bind_graph(struct graph *g, const QnnSystemContext_GraphInfoV1_t *gi) {
+  g->n_in = gi->numGraphInputs;
+  g->n_out = gi->numGraphOutputs;
+  if (g->n_in > MAX_TENSORS || g->n_out > MAX_TENSORS || g->n_in == 0 ||
+      g->n_out == 0) {
+    set_error("tensor count in=%u out=%u", g->n_in, g->n_out);
+    return -1;
+  }
+  for (uint32_t i = 0; i < g->n_in; i++)
+    if (describe(&gi->graphInputs[i], &g->in[i]) != 0) return -1;
+  for (uint32_t i = 0; i < g->n_out; i++)
+    if (describe(&gi->graphOutputs[i], &g->out[i]) != 0) return -1;
+  return 0;
+}
+
 int qnn_load(const char *tag, const char *bin_path) {
   pthread_mutex_lock(&LOCK);
   if (!INIT_DONE) {
@@ -409,7 +511,7 @@ int qnn_load(const char *tag, const char *bin_path) {
 
   g->fd = open(bin_path, O_RDONLY);
   if (g->fd < 0) {
-    set_error("open %s", bin_path);
+    set_error("open %s failed: errno %d (%s)", bin_path, errno, strerror(errno));
     goto fail;
   }
   struct stat st;
@@ -439,23 +541,10 @@ int qnn_load(const char *tag, const char *bin_path) {
     set_error("graphRetrieve '%s' failed", gname);
     goto fail;
   }
-  g->n_in = gi->graphInfoV1.numGraphInputs;
-  g->n_out = gi->graphInfoV1.numGraphOutputs;
-  if (g->n_in > MAX_TENSORS || g->n_out > MAX_TENSORS || g->n_in == 0 ||
-      g->n_out == 0) {
-    set_error("tensor count in=%u out=%u", g->n_in, g->n_out);
+  if (bind_graph(g, &gi->graphInfoV1) != 0) {
+    set_error("tensor setup for %s: %s", bin_path, qnn_last_error());
     goto fail;
   }
-  for (uint32_t i = 0; i < g->n_in; i++)
-    if (describe(&gi->graphInfoV1.graphInputs[i], &g->in[i]) != 0) {
-      set_error("input tensor %u of %s", i, bin_path);
-      goto fail;
-    }
-  for (uint32_t i = 0; i < g->n_out; i++)
-    if (describe(&gi->graphInfoV1.graphOutputs[i], &g->out[i]) != 0) {
-      set_error("output tensor %u of %s", i, bin_path);
-      goto fail;
-    }
 #undef IF
 
   strcpy(g->tag, tag);
@@ -471,6 +560,139 @@ fail:
   return -1;
 }
 
+/* Load a .dlc container. The DLC path differs from the .bin path in one way
+ * only: the system library parses the container and composes the graphs onto a
+ * fresh context itself (no contextCreateFromBinary), after which the graph is
+ * retrieved by name exactly as in the .bin path. The weight memory the graphs
+ * reference stays owned by the DLC handle, which is why free_graph releases it
+ * only after the context is gone. */
+int qnn_load_dlc(const char *tag, const char *dlc_path) {
+  pthread_mutex_lock(&LOCK);
+  if (!INIT_DONE) {
+    set_error("backend not initialised");
+    pthread_mutex_unlock(&LOCK);
+    return -1;
+  }
+  struct graph *g = find_graph(tag);
+  if (g) free_graph(g);
+  g = NULL;
+  for (int i = 0; i < MAX_GRAPHS; i++)
+    if (!GRAPHS[i].used) {
+      g = &GRAPHS[i];
+      break;
+    }
+  if (!g) {
+    set_error("no free graph slots");
+    pthread_mutex_unlock(&LOCK);
+    return -1;
+  }
+  memset(g, 0, sizeof(*g));
+  g->fd = -1;
+
+  /* declared before any goto: the fail path must not cross their init */
+  void *sh = NULL;
+  Qnn_ErrorHandle_t (*sysGetProviders)(const QnnSystemInterface_t ***, uint32_t *) = NULL;
+  const QnnSystemInterface_t **list = NULL;
+  uint32_t nsys = 0;
+  const QnnSystemInterface_t *sys = NULL;
+  QnnSystemContext_GraphInfo_t *graphs = NULL;
+  uint32_t ngraphs = 0;
+  /* declared with the others: the fail path's goto must not cross an
+   * initialisation, and the finalize timing below needs these */
+  Qnn_ErrorHandle_t fe = 0;
+  struct timespec t0, t1;
+
+  sh = dlopen("libQnnSystem.so", RTLD_NOW);
+  if (!sh) {
+    set_error("dlopen libQnnSystem.so: %s", dlerror());
+    goto fail;
+  }
+  sysGetProviders =
+      (Qnn_ErrorHandle_t(*)(const QnnSystemInterface_t ***, uint32_t *))
+          dlsym(sh, "QnnSystemInterface_getProviders");
+  if (!sysGetProviders) {
+    set_error("dlsym QnnSystemInterface_getProviders: %s", dlerror());
+    goto fail;
+  }
+  if (sysGetProviders(&list, &nsys)) {
+    set_error("QnnSystemInterface_getProviders failed");
+    goto fail;
+  }
+  for (uint32_t i = 0; i < nsys; i++)
+    if (list[i]->systemApiVersion.major == QNN_SYSTEM_API_VERSION_MAJOR &&
+        list[i]->systemApiVersion.minor >= QNN_SYSTEM_API_VERSION_MINOR) {
+      sys = list[i];
+      break;
+    }
+  if (!sys) {
+    set_error("no QNN System API %u.%u provider",
+              QNN_SYSTEM_API_VERSION_MAJOR, QNN_SYSTEM_API_VERSION_MINOR);
+    goto fail;
+  }
+#define SIF sys->v1_9
+#define IF  IFACE->v2_34
+  if (SIF.systemDlcCreateFromFile(LOG, dlc_path, &g->dlc)) {
+    set_error("systemDlcCreateFromFile failed for %s", dlc_path);
+    goto fail;
+  }
+  if (IF.contextCreate(BACKEND, DEVICE, NULL, &g->ctx)) {
+    set_error("contextCreate failed for %s", dlc_path);
+    goto fail;
+  }
+  if (SIF.systemDlcComposeGraphs(g->dlc, NULL, 0, BACKEND, g->ctx, *IFACE,
+                                 QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_1,
+                                 &graphs, &ngraphs)) {
+    set_error("systemDlcComposeGraphs failed for %s", dlc_path);
+    goto fail;
+  }
+  if (!graphs || ngraphs != 1) {
+    set_error("expected 1 graph in %s, found %u", dlc_path, ngraphs);
+    goto fail;
+  }
+  if (IF.graphRetrieve(g->ctx, graphs[0].graphInfoV1.graphName, &g->g)) {
+    set_error("graphRetrieve '%s' failed", graphs[0].graphInfoV1.graphName);
+    goto fail;
+  }
+  /* A composed DLC graph arrives unfinalized, unlike a context binary whose
+   * graphs are ready to execute: graphExecute rejects it with
+   * QNN_GRAPH_ERROR_GRAPH_NOT_FINALIZED until finalized. qnn-net-run follows
+   * the same compose -> finalize -> execute sequence, so this call belongs
+   * here even though QnnSystemDlc.h never mentions it. The error handle and
+   * the elapsed time are logged because a full on-device HTP prepare is what
+   * OOMs the phone, and its failure signature is a large error code plus a
+   * long runtime. */
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  fe = IF.graphFinalize(g->g, NULL, NULL);
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  if (fe) {
+    set_error("graphFinalize failed for %s: 0x%llx after %.1f s", dlc_path,
+              (unsigned long long)fe,
+              ((t1.tv_sec - t0.tv_sec) * 1e3 +
+               (t1.tv_nsec - t0.tv_nsec) / 1e6) / 1e3);
+    goto fail;
+  }
+  if (bind_graph(g, &graphs[0].graphInfoV1) != 0) {
+    set_error("tensor setup for %s: %s", dlc_path, qnn_last_error());
+    goto fail;
+  }
+  free(graphs);
+  graphs = NULL;
+#undef SIF
+#undef IF
+
+  strcpy(g->tag, tag);
+  g->used = 1;
+  qlog("loaded '%s' (dlc) in=%u out=%u", tag, g->n_in, g->n_out);
+  pthread_mutex_unlock(&LOCK);
+  return 0;
+
+fail:
+  free(graphs);
+  free_graph(g);
+  pthread_mutex_unlock(&LOCK);
+  return -1;
+}
+
 int qnn_describe(const char *tag, QnnTensorCb in_cb, QnnTensorCb out_cb,
                  void *user) {
   pthread_mutex_lock(&LOCK);
@@ -480,20 +702,22 @@ int qnn_describe(const char *tag, QnnTensorCb in_cb, QnnTensorCb out_cb,
     pthread_mutex_unlock(&LOCK);
     return -1;
   }
+  /* qnn_exec expects the RVC_QNN_* enum, not the raw Qnn_DataType_t, so the
+   * callback contract must match it or every fp16 boundary reports int32. */
   for (uint32_t i = 0; i < g->n_in; i++)
-    if (in_cb) in_cb(user, g->in[i].name, (int)g->in[i].dtype, g->in[i].rank, g->in[i].dims);
+    if (in_cb)
+      in_cb(user, g->in[i].name, rvc_dtype_of(g->in[i].dtype), g->in[i].rank,
+            g->in[i].dims);
   for (uint32_t i = 0; i < g->n_out; i++)
-    if (out_cb) out_cb(user, g->out[i].name, (int)g->out[i].dtype, g->out[i].rank,
-                       g->out[i].dims);
+    if (out_cb)
+      out_cb(user, g->out[i].name, rvc_dtype_of(g->out[i].dtype),
+             g->out[i].rank, g->out[i].dims);
   pthread_mutex_unlock(&LOCK);
   return 0;
 }
 
-int qnn_exec(const char *tag,
-             const char *const *in_names, const int *in_dtypes,
-             const void *const *in_data, const size_t *in_elems, size_t n_in,
-             float **out_data, size_t *out_elems, size_t n_out_max,
-             size_t *n_out) {
+int qnn_exec_raw(const char *tag, const QnnIo *in, size_t n_in,
+                 QnnIo *out, size_t n_out_max, size_t *n_out) {
   pthread_mutex_lock(&LOCK);
   struct graph *g = find_graph(tag);
   if (!g) {
@@ -506,33 +730,38 @@ int qnn_exec(const char *tag,
     pthread_mutex_unlock(&LOCK);
     return -1;
   }
+  if (g->n_out > n_out_max) {
+    set_error("caller provided space for %zu outputs, graph has %u", n_out_max,
+              g->n_out);
+    pthread_mutex_unlock(&LOCK);
+    return -1;
+  }
   for (size_t i = 0; i < n_in; i++) {
     struct tensor *t = NULL;
     for (uint32_t j = 0; j < g->n_in; j++)
-      if (!strcmp(g->in[j].name, in_names[i])) {
+      if (!strcmp(g->in[j].name, in[i].name)) {
         t = &g->in[j];
         break;
       }
     if (!t) {
-      set_error("unknown input '%s' for '%s'", in_names[i], tag);
+      set_error("unknown input '%s' for '%s'", in[i].name, tag);
       pthread_mutex_unlock(&LOCK);
       return -1;
     }
-    int want = (t->dtype == QNN_DATATYPE_FLOAT_32) ? RVC_QNN_FLOAT32
-                                                   : RVC_QNN_INT32;
-    if (in_dtypes[i] != want) {
-      set_error("input '%s' dtype mismatch (want %d got %d)", in_names[i], want,
-                in_dtypes[i]);
+    int want = rvc_dtype_of(t->dtype);
+    if (in[i].dtype != want) {
+      set_error("input '%s' dtype mismatch (want %d got %d)", in[i].name, want,
+                in[i].dtype);
       pthread_mutex_unlock(&LOCK);
       return -1;
     }
-    if (in_elems[i] * 4 != t->bytes) {
-      set_error("input '%s' size %zu elements != %zu bytes expected",
-                in_names[i], in_elems[i], t->bytes / 4);
+    if (in[i].bytes != t->bytes) {
+      set_error("input '%s' is %zu bytes, graph wants %zu", in[i].name,
+                in[i].bytes, t->bytes);
       pthread_mutex_unlock(&LOCK);
       return -1;
     }
-    memcpy(t->buf, in_data[i], t->bytes);
+    memcpy(t->buf, in[i].data, t->bytes);
   }
 
   Qnn_Tensor_t inT[MAX_TENSORS], outT[MAX_TENSORS];
@@ -588,27 +817,62 @@ int qnn_exec(const char *tag,
     return -1;
   }
 
-  if (g->n_out > n_out_max) {
-    set_error("caller provided space for %zu outputs, graph has %u", n_out_max,
-              g->n_out);
-    pthread_mutex_unlock(&LOCK);
-    return -1;
-  }
   for (uint32_t i = 0; i < g->n_out; i++) {
-    size_t elems = g->out[i].bytes / 4;   /* outputs are float32 */
-    float *dst = (float *)malloc(g->out[i].bytes);
-    if (!dst) {
-      for (uint32_t k = 0; k < i; k++) free(out_data[k]);
-      set_error("out of memory for output %u", i);
+    if (!out[i].data) {
+      void *p = malloc(g->out[i].bytes);
+      if (!p) {
+        for (uint32_t k = 0; k < i; k++)
+          if (out[k].data) { free(out[k].data); out[k].data = NULL; }
+        set_error("out of memory for output %u", i);
+        pthread_mutex_unlock(&LOCK);
+        return -1;
+      }
+      out[i].data = p;
+      out[i].dtype = rvc_dtype_of(g->out[i].dtype);
+    } else if (out[i].bytes < g->out[i].bytes) {
+      set_error("output %u buffer is %zu bytes, graph writes %zu", i,
+                out[i].bytes, g->out[i].bytes);
       pthread_mutex_unlock(&LOCK);
       return -1;
     }
-    memcpy(dst, g->out[i].buf, g->out[i].bytes);
-    out_data[i] = dst;
-    out_elems[i] = elems;
+    memcpy(out[i].data, g->out[i].buf, g->out[i].bytes);
+    out[i].bytes = g->out[i].bytes;
+    out[i].name = g->out[i].name;
   }
   *n_out = g->n_out;
   pthread_mutex_unlock(&LOCK);
+  return 0;
+}
+
+int qnn_exec(const char *tag,
+             const char *const *in_names, const int *in_dtypes,
+             const void *const *in_data, const size_t *in_elems, size_t n_in,
+             float **out_data, size_t *out_elems, size_t n_out_max,
+             size_t *n_out) {
+  if (n_in > MAX_TENSORS) {
+    set_error("too many inputs (%zu)", n_in);
+    return -1;
+  }
+  QnnIo io[MAX_TENSORS], oo[MAX_TENSORS];
+  for (size_t i = 0; i < n_in; i++) {
+    size_t es = qnn_elem_size(in_dtypes[i]);
+    if (!es) {
+      set_error("unsupported input dtype %d", in_dtypes[i]);
+      return -1;
+    }
+    io[i].name = in_names[i];
+    io[i].dtype = in_dtypes[i];
+    io[i].data = (void *)in_data[i];
+    io[i].bytes = in_elems[i] * es;
+  }
+  memset(oo, 0, sizeof(oo));
+  size_t got = 0;
+  if (qnn_exec_raw(tag, io, n_in, oo, n_out_max, &got)) return -1;
+  for (size_t i = 0; i < got; i++) {
+    out_data[i] = (float *)oo[i].data;
+    out_elems[i] = oo[i].bytes / 4;   /* legacy callers are all float32 */
+  }
+  *n_out = got;
   return 0;
 }
 
