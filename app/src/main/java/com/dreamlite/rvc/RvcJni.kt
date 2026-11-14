@@ -18,6 +18,9 @@ object RvcJni {
 
     external fun loadGraph(tag: String, binPath: String): String
 
+    /** Load a .dlc container, composing its graphs onto a fresh context. */
+    external fun loadGraphDlc(tag: String, dlcPath: String): String
+
     external fun freeGraph(tag: String): String
 
     /** Graph metadata as JSON: {"tag","inputs":[{"name","dtype","dims"}],...}. */
@@ -56,6 +59,27 @@ object RvcJni {
 
     /** Timing breakdown of the last convert as JSON. */
     external fun pipelineStats(): String
+
+    /** Pitch transpose in semitones (-12..12). "" on success; applies to the
+     * next emitted block without reloading the graphs. */
+    external fun pipelineSetPitch(semitones: Float): String
+
+    /** Official rms_mix_rate (0..1): 0 matches the source loudness, 1 keeps
+     * the converted output's own level. Applies to the next block. */
+    external fun pipelineSetRmsMixRate(rate: Float): String
+
+    /** Official protect (0..0.5): blends the pre-retrieval features back in;
+     * 0.5 is the official client's "off". Applies to the next block. */
+    external fun pipelineSetProtect(protect: Float): String
+
+    /** Official filter_radius (1..7): median-filter window over the f0 track;
+     * 1 is a no-op. Applies to the next block. */
+    external fun pipelineSetFilterRadius(radius: Int): String
+
+    /** Realtime f0 lookahead margin in 100 ms windows: 0 = earliest window
+     * (lowest latency), 1 = one window later (steadier block-tail f0,
+     * +100 ms). Applies to the next blocks. */
+    external fun pipelineSetF0Margin(margin: Int): String
 
     external fun pipelineDestroy()
 

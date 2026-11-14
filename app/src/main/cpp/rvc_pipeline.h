@@ -31,6 +31,13 @@ typedef struct {
   float sine_amp;         /* SineGen amplitude */
   float index_rate;       /* retrieval blend weight; <= 0 disables retrieval */
   int nprobe;             /* inverted-list probe count; <= 0 = use the file's */
+  double pitch_mult;      /* f0 multiplier = 2 ** (semitones / 12); 1.0 = off */
+  double rms_mix_rate;    /* loudness match exponent: 0 = keep source, 1 = keep output */
+  double protect;         /* unvoiced-feature blend; >= 0.5 disables (official off) */
+  int filter_radius;      /* median filter radius in f0 frames; <= 1 disables */
+  int f0_margin;          /* realtime f0 lookahead in 100 ms windows: 0 =
+                             earliest window (lowest latency), 1 = one window
+                             later (steadier block-tail f0, +100 ms) */
 } rvc_voice_t;
 
 typedef struct {
@@ -69,6 +76,22 @@ const char *rvc_pipeline_load_index(rvc_pipeline_t *p, const char *models_dir,
  * there so the HTP stub finds libQnnHtpV79Skel.so. */
 int rvc_pipeline_init(rvc_pipeline_t *p, const char *models_dir,
                       const char *lib_dir, const rvc_voice_t *voice);
+
+/* Sets the pitch transpose in semitones, applied to the f0 track before
+ * pitch-token quantization and the sine-gate phase, so a change takes effect
+ * on the next block without reloading the graphs. */
+void rvc_pipeline_set_pitch(rvc_pipeline_t *p, double semitones);
+
+/* Runtime overrides for the three voice-level tunables. Like pitch, they
+ * take effect on the next emitted block — no graph reload. */
+void rvc_pipeline_set_rms_mix_rate(rvc_pipeline_t *p, double rate);
+void rvc_pipeline_set_protect(rvc_pipeline_t *p, double protect);
+void rvc_pipeline_set_filter_radius(rvc_pipeline_t *p, int radius);
+
+/* Realtime f0 lookahead margin in 100 ms windows; clamped to 0..1. 0 keeps
+ * the earliest window (lowest latency), 1 buys steadier block-tail f0 at the
+ * cost of one extra 100 ms window of lookahead. */
+void rvc_pipeline_set_f0_margin(rvc_pipeline_t *p, int margin);
 
 /* Converts n samples of 16 kHz mono audio. Writes at most out_cap floats to
  * out and returns the count, or -1 on failure (rvc_pipeline_last_error). */

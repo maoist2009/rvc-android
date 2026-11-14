@@ -125,6 +125,7 @@ struct ctx_bufs {
   std::vector<float> m_p, logs_p, g, z_p, mask, z, gate;
   std::vector<int32_t> pitch;
   std::vector<double> f0;
+  std::vector<uint8_t> uv;   /* per-frame voicing of the window the f0 came from */
   int32_t sid = 0;
 };
 
@@ -198,6 +199,12 @@ struct rvc_pipeline {
   std::vector<double> f0_obs;      /* (n_windows * EMIT_FRAMES) */
   std::vector<double> f0_best;     /* per-frame selection cost */
   std::vector<double> f0_track;    /* per-frame selected f0 */
+  std::vector<uint8_t> f0_voiced;  /* per-frame: 1 when rmvpe reported f0>0 */
+  std::vector<uint8_t> f0_uv;      /* per-frame: 1 when the *window* the frame
+                                    * came from had any voiced frame (the
+                                    * official's SineGen uv, which is a
+                                    * window-level mask because get_f0
+                                    * interpolates inside one window only) */
   size_t f0_frames = 0;            /* frames with a selected value */
   size_t f0_windows = 0;           /* RMVPE windows computed */
   std::vector<double> f0_cum;      /* f0_cum[g+1] = sum(f0_track[0..g)) */
@@ -276,6 +283,27 @@ struct rvc_pipeline {
 };
 
 rvc_pipeline_t *rvc_pipeline_create(void) { return new rvc_pipeline(); }
+
+void rvc_pipeline_set_pitch(rvc_pipeline_t *p, double semitones) {
+  p->voice.pitch_mult = std::pow(2.0, semitones / 12.0);
+}
+
+void rvc_pipeline_set_rms_mix_rate(rvc_pipeline_t *p, double rate) {
+  p->voice.rms_mix_rate = rate;
+}
+
+void rvc_pipeline_set_protect(rvc_pipeline_t *p, double protect) {
+  p->voice.protect = protect;
+}
+
+void rvc_pipeline_set_filter_radius(rvc_pipeline_t *p, int radius) {
+  p->voice.filter_radius = radius;
+}
+
+void rvc_pipeline_set_f0_margin(rvc_pipeline_t *p, int margin) {
+  p->voice.f0_margin = (margin < 0) ? 0 : (margin > 1 ? 1 : margin);
+}
+
 void rvc_pipeline_destroy(rvc_pipeline_t *p) {
   if (p) p->stop_npu();   /* never leave the worker on freed memory */
   delete p;
@@ -376,6 +404,16 @@ void f0_to_pitch(const double *f0, int32_t *out, size_t n) {
   }
 }
 
+/* Applies the configured transpose to one f0 window (t_ph frames), in place.
+ * Scaled before both the pitch-token mapping and the sine-gate phase so the
+ * two stay in lockstep; a 1.0 multiplier is skipped outright. */
+static inline void apply_pitch(const rvc_pipeline_t *p, double *f0, size_t n) {
+  const double m = p->voice.pitch_mult;
+  if (m == 1.0) return;
+  for (size_t i = 0; i < n; i++)
+    if (f0[i] > 0.0) f0[i] *= m;
+}
+
 /* np.interp over the unvoiced (== 0) frames, in place. */
 void interp_unvoiced(double *f0, size_t n) {
   std::vector<double> xp, fp;
@@ -384,6 +422,35 @@ void interp_unvoiced(double *f0, size_t n) {
   if (xp.empty()) return;
   for (size_t i = 0; i < n; i++)
     if (f0[i] == 0.0) f0[i] = rvc_np_interp((double)i, xp.data(), fp.data(), xp.size());
+}
+
+/* signal.medfilt on the f0 track, in place.  kernel_size is the official's
+ * odd [filter_radius]; <= 1 is a no-op.  Runs after interp_unvoiced so the
+ * median is over voiced values only (the official pipeline.py applies it
+ * after the uv interpolation too). */
+void apply_filter_radius(double *f0, size_t n, int radius) {
+  if (radius <= 1 || n < 2) return;
+  int k = (radius / 2) * 2 + 1;      /* force odd, like scipy requires */
+  int h = k / 2;
+  if ((size_t)k >= n) {              /* window covers everything: the median */
+    std::vector<double> all(f0, f0 + n);
+    std::nth_element(all.data(), all.data() + n / 2, all.data() + n);
+    double m = all[n / 2];
+    for (size_t i = 0; i < n; i++) f0[i] = m;
+    return;
+  }
+  std::vector<double> tmp(f0, f0 + n);
+  std::vector<double> win(k);
+  for (size_t i = 0; i < n; i++) {
+    int lo = (int)i - h, hi = (int)i + h;
+    int m = 0;
+    for (int j = lo; j <= hi; j++) {
+      size_t u = (j < 0) ? 0 : ((size_t)j >= n ? n - 1 : (size_t)j);
+      win[m++] = tmp[u];
+    }
+    std::nth_element(win.data(), win.data() + h, win.data() + k);
+    f0[i] = win[h];
+  }
 }
 
 /* (32,128) time-major mel -> (1,128,32) channel-major, as the graph wants. */
@@ -541,22 +608,30 @@ void groupnorm_gelu(rvc_pipeline_t *p, const float *src, size_t t1_total,
 /* --------------------------------------------------------- sine gate ------ */
 
 /* precompute_sine_gate: f0 (T) Hz -> (T*upp) float32.  float64 throughout:
- * the phase argument reaches ~2.8e6 samples where float32 resolves ±0.25. */
-void precompute_sine_gate(rvc_pipeline_t *p, const double *f0, int T, int upp,
-                          int sr, double l_w, double l_b, double sine_amp,
-                          double phase_offset, float *gate) {
+ * the phase argument reaches ~2.8e6 samples where float32 resolves ±0.25.
+ *
+ * uv is the official's SineGen voicing mask: uv = (nsff0 > 0) where nsff0 is
+ * the f0 *after* get_f0's unvoiced interpolation.  That interpolation runs on
+ * one RMVPE window at a time, so the mask is window-level: a window with no
+ * voiced frame keeps f0 == 0 (np.interp raises) and the whole window is
+ * unvoiced.  Passing uv == nullptr falls back to "f0 > 0", which is only
+ * correct when f0 was never interpolated (the offline track is, so the batch
+ * path must pass its own window-level mask). */
+void precompute_sine_gate(rvc_pipeline_t *p, const double *f0, const uint8_t *uv,
+                          int T, int upp, int sr, double l_w, double l_b,
+                          double sine_amp, double phase_offset, float *gate) {
   std::vector<double> cum_prev(T);
   double acc = 0.0;
   for (int t = 0; t < T; t++) { cum_prev[t] = acc; acc += f0[t]; }
   const double two_pi_over_sr = 2.0 * M_PI / (double)sr;
   size_t g = 0;
   for (int t = 0; t < T; t++) {
-    double uv = f0[t] > 0.0 ? 1.0 : 0.0;
-    double noise_amp = uv * (double)NOISE_STD + (1.0 - uv) * (sine_amp / 3.0);
+    double u = uv ? (double)uv[t] : (f0[t] > 0.0 ? 1.0 : 0.0);
+    double noise_amp = u * (double)NOISE_STD + (1.0 - u) * (sine_amp / 3.0);
     for (int i = 0; i < upp; i++) {
       double total = cum_prev[t] * (double)upp + f0[t] * (double)(i + 1) +
                      phase_offset;
-      double sine = sine_amp * sin(two_pi_over_sr * total) * uv;
+      double sine = sine_amp * sin(two_pi_over_sr * total) * u;
       double noise = noise_amp * p->randn();   /* SineGen's excitation */
       gate[g++] = (float)tanh(l_w * (sine + noise) + l_b);
     }
@@ -595,9 +670,17 @@ void free_outputs(std::vector<float *> &outs) {
 
 /* compute_f0_track: utterance-level track @100 Hz over the padded signal.
  * RMVPE runs on every 100 ms window; each global frame takes the observation
- * from the window covering it closest to that window's centre. */
+ * from the window covering it closest to that window's centre.
+ *
+ * uv_out gets the SineGen voicing mask of the same selection: 1 when the
+ * window the frame's f0 came from had at least one voiced frame.  The
+ * official's get_f0 interpolates unvoiced frames *inside one window*, so a
+ * window that is entirely unvoiced keeps f0 == 0 and renders noise; a global
+ * interpolation (interp_unvoiced over the whole track) would instead smear a
+ * sine over every silence. */
 int compute_f0_track(rvc_pipeline_t *p, const float *wav_pad, size_t n_pad,
-                     std::vector<double> *track, double *ms_acc) {
+                     std::vector<double> *track, std::vector<uint8_t> *uv_out,
+                     double *ms_acc) {
   const int frames_per_hop = F0_CTX_HOP / (SR16 / 100);   /* 10 */
   size_t n_total = (n_pad + (size_t)(SR16 / 100) - 1) / (size_t)(SR16 / 100);
   size_t n_windows = 1;
@@ -608,6 +691,7 @@ int compute_f0_track(rvc_pipeline_t *p, const float *wav_pad, size_t n_pad,
 
   std::vector<double> obs(n_frames * EMIT_FRAMES, 0.0);
   std::vector<char> known(n_frames * EMIT_FRAMES, 0);
+  std::vector<char> win_voiced(n_windows, 0);
   float mel[32 * 128];
   float mel_graph[1 * 128 * 32];
   float win[F0_WIN];
@@ -639,21 +723,30 @@ int compute_f0_track(rvc_pipeline_t *p, const float *wav_pad, size_t n_pad,
       size_t g = i * (size_t)frames_per_hop + (size_t)j;
       obs[g * EMIT_FRAMES + j] = f0[j];
       known[g * EMIT_FRAMES + j] = 1;
+      if (f0[j] > 0.0) win_voiced[i] = 1;
     }
   }
 
   track->assign(n_frames, 0.0);
+  if (uv_out) uv_out->assign(n_frames, 0);
   const double centre = (double)(EMIT_FRAMES - 1) / 2.0;
   for (size_t g = 0; g < n_frames; g++) {
     double best_cost = 1e300, best_val = 0.0;
+    size_t best_w = 0;
     for (int j = 0; j < EMIT_FRAMES; j++) {
       if (!known[g * EMIT_FRAMES + j]) continue;
       double cost = fabs((double)j - centre);
-      if (cost < best_cost) { best_cost = cost; best_val = obs[g * EMIT_FRAMES + j]; }
+      if (cost < best_cost) {
+        best_cost = cost;
+        best_val = obs[g * EMIT_FRAMES + j];
+        best_w = (g - (size_t)j) / (size_t)frames_per_hop;   /* g = 10w + j */
+      }
     }
     (*track)[g] = best_val;
+    if (uv_out) (*uv_out)[g] = (uint8_t)(best_w < n_windows ? win_voiced[best_w] : 0);
   }
   interp_unvoiced(track->data(), n_frames);
+  apply_filter_radius(track->data(), n_frames, p->voice.filter_radius);
   return 0;
 }
 
@@ -775,9 +868,11 @@ int compute_hubert_ctx(rvc_pipeline_t *p, std::vector<float> *wav, int n_blocks,
 /* ----------------------------------------------------------- synth block -- */
 
 /* run_ctx_block: the three synthesizer graphs on one 280-frame context block.
- * phone (t_ph,768), f0 (t_ph,) -> audio (t_out*upp). */
+ * phone (t_ph,768), f0 (t_ph,), uv (t_ph, window-level voicing, may be null)
+ * -> audio (t_out*upp). */
 int run_ctx_block(rvc_pipeline_t *p, const float *phone_ctx, const double *f0_ctx,
-                  double phase_offset, float *audio_out, double *ms_acc) {
+                  const uint8_t *uv_ctx, double phase_offset, float *audio_out,
+                  double *ms_acc) {
   const int t_ph = p->voice.t_ph, t_out = p->voice.t_out;
   const int t_flow = p->voice.t_flow, dec_head = p->voice.dec_head;
   const int upp = p->voice.upp, sr = p->voice.sr;
@@ -843,7 +938,8 @@ int run_ctx_block(rvc_pipeline_t *p, const float *phone_ctx, const double *f0_ct
 
   /* the NSF source is built from the f0's last t_out frames */
   std::vector<float> gate((size_t)t_out * upp);
-  precompute_sine_gate(p, f0.data() + (t_ph - t_out), t_out, upp, sr,
+  precompute_sine_gate(p, f0.data() + (t_ph - t_out),
+                       uv_ctx ? uv_ctx + (t_ph - t_out) : nullptr, t_out, upp, sr,
                        (double)p->voice.l_w, (double)p->voice.l_b,
                        (double)p->voice.sine_amp, phase_offset, gate.data());
   {
@@ -1014,11 +1110,14 @@ void slot_pool<N>::submitted(uint64_t t) {
 }
 
 /* Real input block i needs before it is computable: the RMVPE window of its
- * last f0 frame (25i + t_ph - 1) must have fully arrived.  compute_f0_track
- * selects, for frame g, the observation from window floor(g/10) - 1. */
+ * last f0 frame (25i + t_ph - 1) must have fully arrived.  For frame g the
+ * observation comes from window floor(g/10) - 2 + f0_margin, clamped at 0:
+ * margin 0 is the earliest window (lowest latency), margin 1 is the previous
+ * behaviour (one 100 ms window later, steadier block tails). */
 static inline size_t stream_need_raw(const rvc_pipeline_t *p, int i) {
   size_t g = (size_t)i * (size_t)CTX_STRIDE + (size_t)p->voice.t_ph - 1;
-  size_t w = (g >= 10) ? g / 10 - 1 : 0;
+  size_t f0_base = (size_t)(20 - 10 * p->voice.f0_margin);
+  size_t w = (g >= f0_base) ? (g - f0_base) / 10 : 0;
   size_t need_sig = (size_t)F0_CTX_HOP * w + (size_t)F0_WIN;
   return (need_sig > (size_t)PAD_SAMPLES) ? need_sig - (size_t)PAD_SAMPLES : 0;
 }
@@ -1055,7 +1154,8 @@ static c0_chunk_t *stream_find_chunk(rvc_pipeline_t *p, size_t c) {
  * output pass does that, so this stays pure host work plus submission. */
 static int stream_prep_block(rvc_pipeline_t *p, int j) {
   size_t g = (size_t)j * (size_t)CTX_STRIDE + (size_t)p->voice.t_ph - 1;
-  size_t need_w = (g >= 10) ? g / 10 - 1 : 0;
+  size_t f0_base = (size_t)(20 - 10 * p->voice.f0_margin);
+  size_t need_w = (g >= f0_base) ? (g - f0_base) / 10 : 0;
   stream_highpass(p, j);
 
   while (p->f0_windows <= need_w) {
@@ -1142,24 +1242,48 @@ static int stream_f0_fold(rvc_pipeline_t *p, size_t need_w) {
     }
     rmvpe_logits_to_f0(j->out[0], f0);
 
+    /* the official's get_f0 interpolates inside this one window, so the
+     * SineGen mask is a window-level property: all-unvoiced window -> f0
+     * stays 0 -> the gate renders noise instead of a sine. */
+    int win_voiced = 0;
+    for (int k = 0; k < EMIT_FRAMES; k++)
+      if (f0[k] > 0.0) { win_voiced = 1; break; }
+
     size_t w = p->f0_folded;
     size_t base = w * (size_t)EMIT_FRAMES;
     if (p->f0_obs.size() < base + (size_t)EMIT_FRAMES)
       p->f0_obs.resize(base + (size_t)EMIT_FRAMES, 0.0);
     for (int k = 0; k < EMIT_FRAMES; k++) p->f0_obs[base + k] = f0[k];
 
+    /* Transpose exactly once, here. f0_track is a growing buffer that later
+     * blocks and the sine-gate cumsum read back, and finalize is called per
+     * emitted block, so scaling the shared track there would re-multiply
+     * every frame on each emit and compound the multiplier. */
+    apply_pitch(p, f0, (size_t)EMIT_FRAMES);
+
     size_t g0 = w * 10;      /* window w covers frames [10w, 10w+32) */
     if (p->f0_track.size() < g0 + (size_t)EMIT_FRAMES) {
       p->f0_track.resize(g0 + (size_t)EMIT_FRAMES, 0.0);
       p->f0_best.resize(g0 + (size_t)EMIT_FRAMES, 1e300);
+      p->f0_voiced.resize(g0 + (size_t)EMIT_FRAMES, 0);
+      p->f0_uv.resize(g0 + (size_t)EMIT_FRAMES, 0);
       p->f0_frames = p->f0_track.size();
     }
     for (int k = 0; k < EMIT_FRAMES; k++) {
       size_t g = g0 + (size_t)k;
-      double cost = fabs((double)k - centre);
+      /* Onset: everything before PAD_FRAMES is the 2.5 s zero pad, so for the
+       * first 100 ms of real audio prefer the freshest window (the frame sits
+       * at that window's head, with ~no pad in front of it) over the
+       * centre-most one, which would be mostly pad.  Those frames are only
+       * covered by windows <= PAD_FRAMES/10, so no later fold can overwrite
+       * an already-emitted frame and shift the phase anchor. */
+      double cost = (g < (size_t)PAD_FRAMES + 10) ? (double)k
+                                                  : fabs((double)k - centre);
       if (cost < p->f0_best[g]) {
         p->f0_best[g] = cost;
         p->f0_track[g] = f0[k];
+        p->f0_voiced[g] = (f0[k] > 0.0) ? 1 : 0;
+        p->f0_uv[g] = (uint8_t)win_voiced;
       }
     }
     p->f0_folded++;
@@ -1175,6 +1299,7 @@ static int stream_f0_fold(rvc_pipeline_t *p, size_t need_w) {
  * the sine-gate phase is anchored to. */
 static void stream_f0_finalize(rvc_pipeline_t *p) {
   interp_unvoiced(p->f0_track.data(), p->f0_frames);
+  apply_filter_radius(p->f0_track.data(), p->f0_frames, p->voice.filter_radius);
   p->f0_cum.assign(p->f0_frames + 1, 0.0);
   for (size_t g = 0; g < p->f0_frames; g++)
     p->f0_cum[g + 1] = p->f0_cum[g] + p->f0_track[g];
@@ -1243,7 +1368,6 @@ static void stream_c0_gather(rvc_pipeline_t *p, int i) {
  * encoder.  All five R slices are submitted in a burst so the NPU runs them
  * back to back; their results are collected afterwards. */
 static int stream_out_features(rvc_pipeline_t *p, int i, int par) {
-  (void)i;
   double t0 = now_ms();
   groupnorm_gelu(p, p->c0_buf.data(), (size_t)HUBERT_T1_LEN, 0,
                  p->gn_out[par].data(), HUBERT_T1_LEN);
@@ -1311,6 +1435,32 @@ static int stream_out_features(rvc_pipeline_t *p, int i, int par) {
     rvc_index_apply(p->index, p->raw_feat[par].data(), (size_t)n,
                     p->voice.index_rate, p->voice.nprobe);
     p->st_index += now_ms() - tix;
+
+    /* protect: on unvoiced frames pull the retrieval result back toward the
+     * pre-retrieval one, exactly the official
+     * pitchff[pitchf<1]=protect; feats*pitchff + feats0*(1-pitchff)
+     * (pipeline.py:209-216).  Voiced frames are left as the retrieval result;
+     * >= 0.5 is the official's "off".  The blend needs the raw rows, so it
+     * has to happen before [r] is reassigned. */
+    if (p->voice.protect < 0.5) {
+      const double w = p->voice.protect;
+      const float *raw = r;      /* still the untouched enc output here */
+      float *bl = p->raw_feat[par].data();
+      const size_t c0i = (size_t)i * (size_t)CTX_STRIDE;
+      for (int f = 0; f < n; f++) {
+        /* enc frame f covers f0 frames 2f and 2f+1; either unvoiced counts
+         * (the official test is per f0 frame). */
+        const size_t g0 = c0i + (size_t)(2 * f);
+        const int uv = (g0 + 1 < p->f0_voiced.size()) &&
+                       (!(p->f0_voiced[g0] || p->f0_voiced[g0 + 1]));
+        if (!uv) continue;
+        float *row = bl + (size_t)f * (size_t)HUBERT_DIM;
+        const float *rawrow = raw + (size_t)f * (size_t)HUBERT_DIM;
+        for (int d = 0; d < HUBERT_DIM; d++)
+          row[d] = (float)((double)row[d] * w + (double)rawrow[d] * (1.0 - w));
+      }
+    }
+
     r = p->raw_feat[par].data();
   }
   for (int f = 0; f < n; f++)
@@ -1339,6 +1489,7 @@ static int stream_synth(rvc_pipeline_t *p, int i, int par, float *out) {
                       p->f0_cum[(size_t)PAD_FRAMES]) * (double)upp;
 
   c->f0.assign(p->f0_track.data() + c0i, p->f0_track.data() + c0i + t_ph);
+  c->uv.assign(p->f0_uv.data() + c0i, p->f0_uv.data() + c0i + t_ph);
   interp_unvoiced(c->f0.data(), (size_t)t_ph);
   c->pitch.resize((size_t)t_ph);
   f0_to_pitch(c->f0.data(), c->pitch.data(), (size_t)t_ph);
@@ -1353,7 +1504,8 @@ static int stream_synth(rvc_pipeline_t *p, int i, int par, float *out) {
 
   /* the NSF source only depends on f0, so build it while encflow runs */
   c->gate.resize((size_t)t_out * upp);
-  precompute_sine_gate(p, c->f0.data() + (t_ph - t_out), t_out, upp, sr,
+  precompute_sine_gate(p, c->f0.data() + (t_ph - t_out),
+                       c->uv.data() + (t_ph - t_out), t_out, upp, sr,
                        (double)p->voice.l_w, (double)p->voice.l_b,
                        (double)p->voice.sine_amp, phase_off, c->gate.data());
 
@@ -1433,6 +1585,39 @@ static int stream_synth(rvc_pipeline_t *p, int i, int par, float *out) {
   memcpy(p->sola_buf.data(), p->seg.data() + block_frame,
          (size_t)sola_buffer * sizeof(float));
   memcpy(out, p->seg.data(), (size_t)block_frame * sizeof(float));
+
+  /* RVC loudness match on this block: (rms_in / rms_out) ** (1 - rate), the
+   * same change_rms() the offline path applies to the whole utterance, but
+   * per emitted block — the streaming path emits incrementally and never
+   * revisits a block, so the source side is matched against exactly the
+   * 250 ms slice that produced this output: in_frame = 4000 samples @16 kHz
+   * for the 10000-sample @40 kHz block, both starting at real i*250 ms, and
+   * every input sample has already arrived (no lookahead). */
+  if (p->voice.rms_mix_rate < 1.0) {
+    const int in_frame = block_frame * SR16 / sr;
+    const size_t in_lo = (size_t)PAD_SAMPLES + (size_t)i * (size_t)CTX_STRIDE * 160;
+    std::vector<double> in_d((size_t)in_frame, 0.0);
+    if (in_lo < p->sig.size()) {
+      size_t avail = p->sig.size() - in_lo;
+      size_t take = avail < (size_t)in_frame ? avail : (size_t)in_frame;
+      for (size_t k = 0; k < take; k++)
+        in_d[k] = (double)p->sig[in_lo + k];
+    }
+    std::vector<double> out_d((size_t)block_frame);
+    for (int k = 0; k < block_frame; k++) out_d[k] = (double)out[k];
+
+    /* one envelope value per block (frame_length = block, hop = block) */
+    double env_in = 0.0, env_out = 0.0;
+    for (size_t k = 0; k < in_d.size(); k++)
+      env_in += in_d[k] * in_d[k];
+    for (size_t k = 0; k < out_d.size(); k++)
+      env_out += out_d[k] * out_d[k];
+    env_in = sqrt(env_in / (double)in_frame);
+    env_out = sqrt(env_out / (double)block_frame);
+    if (env_out < 1e-3) env_out = 1e-3;   /* official's rms2 floor */
+    double gain = pow(env_in / env_out, 1.0 - p->voice.rms_mix_rate);
+    for (int k = 0; k < block_frame; k++) out[k] = (float)(out[k] * gain);
+  }
 
   /* official scales down only, never up (pipeline.py:402-405) */
   float peak = 0.0f;
@@ -1543,7 +1728,8 @@ long rvc_pipeline_convert(rvc_pipeline_t *p, const float *x16k, size_t n,
 
   t0 = now_ms();
   std::vector<double> track;
-  if (compute_f0_track(p, wav.data(), wav.size(), &track, &st->ms_f0) != 0)
+  std::vector<uint8_t> uv;
+  if (compute_f0_track(p, wav.data(), wav.size(), &track, &uv, &st->ms_f0) != 0)
     return -1;
   st->ms_f0 = now_ms() - t0;
 
@@ -1558,6 +1744,13 @@ long rvc_pipeline_convert(rvc_pipeline_t *p, const float *x16k, size_t n,
     double last = track.empty() ? 0.0 : track.back();
     track.resize((size_t)need, last);
   }
+  if ((long)uv.size() < need) {
+    uint8_t last = uv.empty() ? 0 : uv.back();
+    uv.resize((size_t)need, last);
+  }
+  /* transpose the whole track before the cumsum so the sine-gate phase
+   * anchor and every block window see the same scaled f0. */
+  apply_pitch(p, track.data(), (size_t)need);
   std::vector<double> cum((size_t)need + 1, 0.0);
   for (long i = 0; i < need; i++) cum[i + 1] = cum[i] + track[i];
   double pad_phase = cum[PAD_FRAMES];   /* the leading zeros' contribution */
@@ -1579,11 +1772,13 @@ long rvc_pipeline_convert(rvc_pipeline_t *p, const float *x16k, size_t n,
     int c0i = i * CTX_STRIDE;
     const float *phone = feat.data() + (size_t)i * t_ph * HUBERT_DIM;
     const double *f0b = track.data() + c0i;
+    const uint8_t *uvb = uv.data() + c0i;
 
     /* SineGen's phase runs across callbacks: anchor this block's harmonic
      * phase to the utterance start. */
     double phase_off = (cum[c0i + PAD_FRAMES] - pad_phase) * (double)upp;
-    if (run_ctx_block(p, phone, f0b, phase_off, audio.data(), &st->ms_synth) != 0)
+    if (run_ctx_block(p, phone, f0b, uvb, phase_off, audio.data(),
+                      &st->ms_synth) != 0)
       return -1;
 
     /* SOLA: cross-correlate the incoming head against the stored tail, pick
@@ -1618,12 +1813,17 @@ long rvc_pipeline_convert(rvc_pipeline_t *p, const float *x16k, size_t n,
   size_t target = (size_t)llround((double)n * (double)sr / (double)SR16);
   if (target > out_n) target = out_n;
 
-  /* RVC loudness match: (rms_in / rms_out) ** (1 - rate), rate 0.25 */
-  t0 = now_ms();
-  std::vector<float> rms_buf(target);
-  rvc_change_rms(hp.data(), n, out, target, SR16, sr, 0.25, rms_buf.data());
-  st->ms_rms = now_ms() - t0;
-  memcpy(out, rms_buf.data(), target * sizeof(float));
+  /* RVC loudness match: (rms_in / rms_out) ** (1 - rate). rate = rms_mix_rate;
+   * 0 fully matches the source, 1 leaves the output untouched — the official
+   * pipeline.py skips the step entirely at 1, and so do we. */
+  if (p->voice.rms_mix_rate < 1.0) {
+    t0 = now_ms();
+    std::vector<float> rms_buf(target);
+    rvc_change_rms(hp.data(), n, out, target, SR16, sr,
+                   p->voice.rms_mix_rate, rms_buf.data());
+    st->ms_rms = now_ms() - t0;
+    memcpy(out, rms_buf.data(), target * sizeof(float));
+  }
 
   /* official scales down only, never up (pipeline.py:402-405) */
   float peak = 0.0f;
@@ -1707,6 +1907,8 @@ int rvc_pipeline_start_stream(rvc_pipeline_t *p) {
   p->f0_obs.clear();
   p->f0_best.clear();
   p->f0_track.clear();
+  p->f0_voiced.clear();
+  p->f0_uv.clear();
   p->f0_cum.clear();
   p->f0_frames = 0;
   p->f0_windows = 0;
@@ -1799,7 +2001,8 @@ long rvc_pipeline_feed_stream(rvc_pipeline_t *p, const float *x, size_t n,
 
     double t_blk = now_ms();
     size_t g = (size_t)i * (size_t)CTX_STRIDE + (size_t)p->voice.t_ph - 1;
-    size_t need_w = (g >= 10) ? g / 10 - 1 : 0;
+    size_t f0_base = (size_t)(20 - 10 * p->voice.f0_margin);
+  size_t need_w = (g >= f0_base) ? (g - f0_base) / 10 : 0;
     int par = i & 1;
     if (stream_f0_fold(p, need_w) != 0) goto fail;
     stream_f0_finalize(p);

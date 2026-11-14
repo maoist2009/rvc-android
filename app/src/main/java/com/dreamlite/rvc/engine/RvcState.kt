@@ -45,6 +45,11 @@ data class RvcStats(
     val msF0: Float,
     val msEnc: Float,
     val msSynth: Float,
+    val msC0: Float,
+    val msGn: Float,
+    val msR: Float,
+    val msSola: Float,
+    val graphCalls: Long,
     val peak: Float,
 ) {
     companion object {
@@ -60,6 +65,12 @@ data class RvcStats(
                 msF0 = o.optDouble("ms_f0", 0.0).toFloat(),
                 msEnc = o.optDouble("ms_enc", 0.0).toFloat(),
                 msSynth = o.optDouble("ms_synth", 0.0).toFloat(),
+                msC0 = o.optDouble("ms_c0", 0.0).toFloat(),
+                msGn = o.optDouble("ms_gn", 0.0).toFloat(),
+                msR = o.optDouble("ms_r", 0.0).toFloat(),
+                msSola = o.optDouble("ms_sola", 0.0).toFloat(),
+                graphCalls = o.optLong("graph_calls", 0),
+                // kept for the offline path, not used in live stats
                 peak = o.optDouble("peak", 0.0).toFloat(),
             )
         } catch (e: Exception) {
