@@ -417,6 +417,11 @@ class PipelineReceiver : BroadcastReceiver() {
         val input = intent.getStringExtra("input") ?: "test_input.f32"
         val output = intent.getStringExtra("output") ?: "stream_output.f32"
         Log.i(TAG, "realtime: mic=$mic input=$input output=$output")
+        // The file path drives the one global native pipeline itself, so a
+        // second delivery while one is running fed the same pipeline twice —
+        // doubled-length output, and a start_stream over a live NPU worker.
+        // Mic mode hands the pipeline to the live session and is left to it.
+        if (!mic && !claimRun("realtime")) return
         val pending = goAsync()
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             try {
@@ -475,6 +480,7 @@ class PipelineReceiver : BroadcastReceiver() {
             } catch (t: Throwable) {
                 Log.e(TAG, "realtime receiver threw", t)
             } finally {
+                if (!mic) converting.set(false)
                 try { RvcLiveService.stop(context) } catch (t: Throwable) { }
                 pending.finish()
             }
@@ -483,10 +489,7 @@ class PipelineReceiver : BroadcastReceiver() {
 
     private fun runConvert(context: Context, intent: Intent) {
         val app = context.applicationContext as DreamLiteApp
-        if (!converting.compareAndSet(false, true)) {
-            Log.w(TAG, "convert already running, ignoring")
-            return
-        }
+        if (!claimRun("convert")) return
         val input = intent.getStringExtra("input") ?: "b8231_in.mp3"
         val outF32 = intent.getStringExtra("output") ?: "convert_out.f32"
         val outWav = intent.getStringExtra("wav") ?: "convert_out.wav"
@@ -590,6 +593,14 @@ class PipelineReceiver : BroadcastReceiver() {
         private const val TAG = "rvc_pipeline_test"
         private const val BLOCK = 4000
         private val converting = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        /** Single-flight claim for a shell-driven run: a duplicate or retried
+         * broadcast must not start a second run on the one global pipeline. */
+        private fun claimRun(what: String): Boolean {
+            val ok = converting.compareAndSet(false, true)
+            if (!ok) Log.w(TAG, "$what already running, ignoring")
+            return ok
+        }
         const val ACTION_PIPELINE = "com.dreamlite.rvc.RUN_PIPELINE"
         const val ACTION_REALTIME = "com.dreamlite.rvc.RUN_REALTIME"
         const val ACTION_CONVERT = "com.dreamlite.rvc.RUN_CONVERT"

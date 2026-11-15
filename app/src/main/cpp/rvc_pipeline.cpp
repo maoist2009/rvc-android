@@ -1899,6 +1899,12 @@ int rvc_pipeline_start_stream(rvc_pipeline_t *p) {
   const int upp = p->voice.upp;
   const int sola_buffer = 4 * upp;
 
+  /* A start with no end in between (two runs racing on the one global
+   * pipeline, or a caller that never reached end_stream) used to assign over
+   * a still-joinable std::thread, and std::thread's move-assign into a
+   * joinable thread calls std::terminate.  Join the stale worker first. */
+  p->stop_npu();
+
   p->stream_on = true;
   p->sig.assign((size_t)PAD_SAMPLES, 0.0f);
   p->n_real = 0;
